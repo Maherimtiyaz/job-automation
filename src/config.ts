@@ -2,10 +2,12 @@ import { config as loadDotenv } from "dotenv";
 import { z } from "zod";
 
 export const DEFAULT_DATABASE_PATH = "data/job-automation.db";
+export const DEFAULT_PROFILE_PATH = "data/profile.json";
 
 const envSchema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
   DATABASE_PATH: z.string().trim().min(1).default(DEFAULT_DATABASE_PATH),
+  PROFILE_PATH: z.string().trim().min(1).default(DEFAULT_PROFILE_PATH),
 });
 
 export type AppConfig = z.infer<typeof envSchema>;

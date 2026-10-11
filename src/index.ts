@@ -1,9 +1,3 @@
-import { loadConfig } from "./config.js";
+import { runCli } from "./cli.js";
 
-function main(): void {
-  const config = loadConfig();
-  console.log(`[job-automation] started (NODE_ENV=${config.NODE_ENV})`);
-  console.log(`[job-automation] database: ${config.DATABASE_PATH}`);
-}
-
-main();
+process.exitCode = runCli(process.argv.slice(2));
