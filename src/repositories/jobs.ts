@@ -100,6 +100,22 @@ UPDATE jobs SET
   salary_max = @salaryMax,
   salary_currency = @salaryCurrency,
   match_score = @matchScore,
+  last_seen_at = @lastSeenAt,
+  updated_at = @updatedAt
+WHERE id = @id
+`;
+
+const UPDATE_JOB_MUTABLE_INVALIDATE_SCORE = `
+UPDATE jobs SET
+  title = @title,
+  location = @location,
+  employment_type = @employmentType,
+  workplace_type = @workplaceType,
+  description = @description,
+  salary_min = @salaryMin,
+  salary_max = @salaryMax,
+  salary_currency = @salaryCurrency,
+  match_score = @matchScore,
   score_version = NULL,
   score_total = NULL,
   score_coverage = NULL,
@@ -243,9 +259,39 @@ export class JobRepository {
     }
   }
 
+  private scoringFieldsChanged(id: number, data: NormalizedJobInput): boolean {
+    const row = this.db
+      .prepare(
+        `SELECT title, location, employment_type, workplace_type, description
+         FROM jobs WHERE id = ?`,
+      )
+      .get(id) as
+      | {
+          title: string;
+          location: string | null;
+          employment_type: string | null;
+          workplace_type: string;
+          description: string | null;
+        }
+      | undefined;
+    if (row === undefined) {
+      throw new NotFoundError("Job", id);
+    }
+    return (
+      row.title !== data.title ||
+      row.location !== (data.location ?? null) ||
+      row.employment_type !== (data.employmentType ?? null) ||
+      row.workplace_type !== data.workplaceType ||
+      row.description !== (data.description ?? null)
+    );
+  }
+
   private refreshMutableFields(id: number, data: NormalizedJobInput): Job {
     const timestamp = nowIso();
-    this.db.prepare(UPDATE_JOB_MUTABLE).run({
+    const mutate = this.scoringFieldsChanged(id, data)
+      ? UPDATE_JOB_MUTABLE_INVALIDATE_SCORE
+      : UPDATE_JOB_MUTABLE;
+    this.db.prepare(mutate).run({
       id,
       title: data.title,
       location: data.location,

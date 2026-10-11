@@ -10,25 +10,42 @@ architectural decisions change.
 - `npm test` — Node.js built-in test runner via `tsx --test` (discovers `**/*.test.ts`)
 - `npm run build` — emit `dist/` with `tsc`
 - `npm start` — run the compiled `dist/index.js`
+- `npm run test:smoke` — opt-in live network smoke test (`tests/sources/live-smoke.ts`); it is a
+  script, not a `*.test.ts` file, so `npm test` never runs it. Set `LIVE_SMOKE=1` to execute it.
 
 The compiled entry point is also the CLI:
 
 - `node dist/index.js status` (default) — database records + scored-job count + profile gaps
 - `node dist/index.js score [--force]` — score jobs whose stored `score_version` is stale, or all with `--force`
 - `node dist/index.js profile:init [--force]` — write a starter profile template to `PROFILE_PATH`
+- `node dist/index.js companies:init [--force]` — write a starter company registry template to `COMPANIES_PATH`
+- `node dist/index.js companies:add --name "Acme" --ats <greenhouse|lever|other> [--board TOKEN] [--website URL] [--careers URL] [--notes TEXT]`
+- `node dist/index.js companies:list` / `companies:enable --name X` / `companies:disable --name X`
+- `node dist/index.js jobs sources` — list sources and how many enabled companies target each
+- `node dist/index.js jobs discover [--source <greenhouse|lever>] [--limit N] [--dry-run] [--company NAME]`
+- `node dist/index.js jobs list [--limit N] [--min-score N]`
+- `node dist/index.js jobs show <id>` — job details + stored score breakdown
 
 ## Architecture
 
 Layers, from outside in:
 
-- `src/config.ts` — Zod-validated environment configuration (`NODE_ENV`, `DATABASE_PATH`, `PROFILE_PATH`).
-- `src/cli.ts` — command dispatch for the compiled CLI; never holds business logic.
+- `src/config.ts` — Zod-validated environment configuration (`NODE_ENV`, `DATABASE_PATH`, `PROFILE_PATH`, `COMPANIES_PATH`).
+- `src/cli.ts` — async command dispatch for the compiled CLI; never holds business logic.
 - `src/db/` — SQLite connection, versioned migrations, diagnostics. No domain logic.
 - `src/domain/` — pure domain types, Zod schemas, status policy, normalization,
   error classes, time helpers, and scoring types/constants. No SQL, no I/O, no `Date.now()`.
 - `src/scoring/` — the deterministic scoring algorithm (`scoreJob.ts`) and the
   DB-backed orchestration (`scoreJobs.ts`). Depends on `src/domain/` types only.
+- `src/sources/` — job source adapters. Each adapter talks to one public, documented,
+  unauthenticated job feed, normalizes rows into validated `SourceListing` objects, and
+  counts invalid rows. Real HTTP enters through `createFetchJson()` (`src/sources/http.ts`),
+  which is injectable so tests never hit the network.
+- `src/registry/` — the company registry JSON file: which companies to discover, their ATS
+  platform, and the board token for that platform.
 - `src/profile/` — reading/writing the candidate profile JSON file.
+- `src/ingest/` — the ingestion pipeline: fetch listings per enabled company, dedupe,
+  upsert, rescore when needed, and produce a summary.
 - `src/repositories/` — data access. Accept `unknown` at the boundary, validate with
   the domain schemas, and translate SQLite errors into domain errors.
 - `src/index.ts` — entry point; delegates to `runCli`. Diagnostic only.
@@ -136,7 +153,9 @@ implemented in `src/scoring/scoreJob.ts`.
 - Scores persist on `jobs` (v2): `score_version`, `score_total`, `score_coverage`,
   `score_confidence`, `score_recommendation`, `score_breakdown` (JSON of components +
   reasons), `scored_at`. `JobRepository.upsert`/`refreshMutableFields` invalidates these
-  columns so content changes trigger rescoring via `listNeedingScoring(version)`.
+  columns only when a scoring-relevant field actually changes (title, description, location,
+  employment type, workplace type), so content changes trigger rescoring via
+  `listNeedingScoring(version)`. Salary-only updates do not invalidate a stored score.
   `score_total` is the numeric score; `list({ minScore })` and `list({ recommendation })`
   filter on it.
 
@@ -149,6 +168,65 @@ template from `createEmptyProfile()`. The template only fills the four known tar
 invented here. `src/domain/profile.ts` owns the Zod schema; `src/profile/profileStore.ts`
 owns file I/O and surfaces `ProfileNotFoundError` for missing files.
 
+## Company registry
+
+Stored as a local JSON file at `COMPANIES_PATH` (default `data/companies.json`), never
+committed. Owned by `src/registry/companyStore.ts`; the file shape is
+`{ "version": 1, "companies": [...] }`, validated by `CompanyRegistrySchema`.
+
+Each entry has `name`, optional `website`/`careersUrl`/`notes`, `atsPlatform`
+(`greenhouse` | `lever` | `other`), an optional `boardToken` (the Greenhouse board token or
+Lever posting site), and `active` (default `true`). `boardToken` is required whenever
+`atsPlatform` is not `other`. The registry is the source of truth for discovery; only
+`active` companies on a supported platform are fetched. `companies:add` writes the entry
+directly to this file. The registry is separate from the `companies` SQL table (which is the
+FK target for jobs and holds only name/website/careers_url/ats_platform; board tokens stay
+in the JSON file, never in the database).
+
+## Job discovery sources
+
+`src/sources/types.ts` owns `SourceId` (`greenhouse`, `lever`), `SourceListing` (the
+normalized row that validation and ingestion depend on), and the `JobSourceAdapter`
+interface. Adapters implement `fetchListings({ company, limit })` and return validated
+listings plus an `invalid` count and `requestsMade`. They are layered over an injectable
+`FetchJson` (`src/sources/http.ts`) that adds an abort timeout and maps network/HTTP/JSON
+failures to `SourceHttpError`/`SourceError`; tests inject a fake `FetchJson` so no unit
+test hits the network.
+
+- Greenhouse: `GET https://boards-api.greenhouse.io/v1/boards/{boardToken}/jobs?content=true`
+  (public, no auth). `content` is HTML (may be double-encoded) and is flattened with
+  `stripHtmlToText()`. `workplaceType` is inferred from the location name (`remote` /
+  `hybrid` / `unknown`). The feed does not expose an employment type, so it stays `null`.
+  Listings dedupe on the Greenhouse job `id`. This endpoint is fetched once — pagination is
+  not documented for it, so very large boards may be truncated by the API (known limitation).
+- Lever: `GET https://api.lever.co/v0/postings/{site}?mode=json` (public, no auth), looped
+  with `skip`/`limit` (page size 100, capped at 25 requests). `categories.commitment` maps
+  to an employment type; `workplaceType` or `allLocations` drives the workplace type;
+  `descriptionPlain` (fallback `descriptionBodyPlain`) becomes the description. Listings
+  dedupe on the Lever posting `id`.
+
+No adapter scrapes proprietary pages, bypasses CAPTCHAs, or sends candidate/personal data.
+A company with `atsPlatform: "other"` is never fetched.
+
+## Ingestion
+
+`src/ingest/ingest.ts` runs the pipeline: for each requested source, for each enabled
+company, fetch listings (sequential requests with `delayMs`, default 300), classify each
+listing, upsert, and score. It never creates applications.
+
+- Dedupe: the listing's external id (`ext:<source>:<externalJobId>`) plus an in-batch
+  seen-set. A repeated key in one batch is a `duplicate`; otherwise `JobRepository.upsert`
+  inserts or refreshes. In dry-run mode nothing is written (company existence is checked,
+  companies are not created).
+- Scoring: after an insert, or after an update whose scoring-relevant fields changed, the
+  job is scored immediately with the injected profile; a scoring exception increments
+  `scoringFailures` and keeps the job. Without a profile, ingestion proceeds unscored.
+- Isolation: a failure fetching one company is caught, counted as a `sourceFailure`, and
+  does not stop other companies or sources.
+
+Summary invariants (report these in CLI output): `valid = inserted + updated + duplicates`
+and `listingsFetched = valid + invalid`.
+
 ## Testing
 
 - Use `node:test` + `node:assert/strict` through `tsx`. Do not add Vitest/Jest.
@@ -156,3 +234,7 @@ owns file I/O and surfaces `ProfileNotFoundError` for missing files.
   development database. Clean up temp files/directories and close connections.
 - Cover validation, deduplication, status transitions, atomic audit events, and
   rollback behavior.
+- Source adapters and ingestion are tested with injected stub `FetchJson`/adapter/score
+  functions — never real HTTP. `tests/sources/live-smoke.ts` is the opt-in live check
+  (run `npm run test:smoke` with `LIVE_SMOKE=1`); it fetches known public sample boards and
+  must not require personal data.
