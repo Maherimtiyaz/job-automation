@@ -24,6 +24,7 @@ import {
 import type { JobScore, StoredScoreBreakdown } from "../domain/scoring.js";
 import { StoredScoreBreakdownSchema } from "../domain/scoring.js";
 import { nowIso } from "../domain/time.js";
+import type { ReviewStatus } from "../domain/review.js";
 
 interface JobRow {
   id: number;
@@ -40,6 +41,7 @@ interface JobRow {
   salary_max: number | null;
   salary_currency: string | null;
   match_score: number | null;
+  review_status: string;
   score_version: number | null;
   score_total: number | null;
   score_coverage: number | null;
@@ -156,6 +158,7 @@ function mapJob(row: JobRow): Job {
     salaryMax: row.salary_max,
     salaryCurrency: row.salary_currency,
     matchScore: row.match_score,
+    reviewStatus: row.review_status as ReviewStatus,
     scoreVersion: row.score_version,
     scoreTotal: row.score_total,
     scoreCoverage: row.score_coverage,
@@ -370,6 +373,10 @@ export class JobRepository {
     if (filter.minScore !== undefined) {
       clauses.push("score_total IS NOT NULL AND score_total >= ?");
       params.push(filter.minScore);
+    }
+    if (filter.reviewStatus !== undefined) {
+      clauses.push("review_status = ?");
+      params.push(filter.reviewStatus);
     }
 
     const where = clauses.length > 0 ? ` WHERE ${clauses.join(" AND ")}` : "";

@@ -15,6 +15,7 @@ architectural decisions change.
 
 The compiled entry point is also the CLI:
 
+- `node dist/index.js dashboard` — review queue + application pipeline at a glance
 - `node dist/index.js status` (default) — database records + scored-job count + profile gaps
 - `node dist/index.js score [--force]` — score jobs whose stored `score_version` is stale, or all with `--force`
 - `node dist/index.js profile:init [--force]` — write a starter profile template to `PROFILE_PATH`
@@ -23,14 +24,22 @@ The compiled entry point is also the CLI:
 - `node dist/index.js companies:list` / `companies:enable --name X` / `companies:disable --name X`
 - `node dist/index.js jobs sources` — list sources and how many enabled companies target each
 - `node dist/index.js jobs discover [--source <greenhouse|lever>] [--limit N] [--dry-run] [--company NAME]`
-- `node dist/index.js jobs list [--limit N] [--min-score N]`
-- `node dist/index.js jobs show <id>` — job details + stored score breakdown
+- `node dist/index.js jobs list [--limit N] [--min-score N] [--recommendation R] [--source S] [--company NAME] [--state S]`
+- `node dist/index.js jobs show <id>` — job details + stored score breakdown + relevance verdict
+- `node dist/index.js jobs review [--limit N] [--min-score N] [--state S] [--include-all]`
+- `node dist/index.js jobs shortlist <id> [--reason TEXT]` / `jobs dismiss <id> [--reason TEXT]`
+- `node dist/index.js jobs ready <id>` / `jobs reopen <id>` / `jobs review-history <id>`
+- `node dist/index.js applications create <jobId> [--resume VERSION] [--notes TEXT]`
+- `node dist/index.js applications list [--status S] [--limit N]`
+- `node dist/index.js applications show <id>` / `applications status <id> <STATUS> [--message TEXT]`
+- `node dist/index.js applications events <id>`
 
 ## Architecture
 
 Layers, from outside in:
 
-- `src/config.ts` — Zod-validated environment configuration (`NODE_ENV`, `DATABASE_PATH`, `PROFILE_PATH`, `COMPANIES_PATH`).
+- `src/config.ts` — Zod-validated environment configuration (`NODE_ENV`, `DATABASE_PATH`,
+  `PROFILE_PATH`, `COMPANIES_PATH`, `RELEVANCE_MIN_SCORE`, `RELEVANCE_MIN_ROLE_SCORE`).
 - `src/cli.ts` — async command dispatch for the compiled CLI; never holds business logic.
 - `src/db/` — SQLite connection, versioned migrations, diagnostics. No domain logic.
 - `src/domain/` — pure domain types, Zod schemas, status policy, normalization,
@@ -81,21 +90,70 @@ Rules:
 
 ## Application lifecycle
 
-Statuses: `DISCOVERED`, `MATCHED`, `REVIEW`, `READY_TO_APPLY`, `IN_PROGRESS`,
-`WAITING_FOR_HUMAN`, `APPROVED`, `SUBMITTED`, `FAILED`, `WITHDRAWN`, `REJECTED`,
-`INTERVIEW`, `OFFER`, `REJECTED_AFTER_INTERVIEW`.
+Statuses: `DRAFT`, `IN_PROGRESS`, `WAITING_FOR_HUMAN`, `APPROVED`, `SUBMITTED`,
+`FAILED`, `WITHDRAWN`, `REJECTED`, `INTERVIEW`, `OFFER`, `REJECTED_AFTER_INTERVIEW`.
 
-Transitions are defined in `src/domain/status.ts` and enforced by
-`ApplicationRepository.transitionStatus`. Every accepted transition writes one
-`application_events` row in the same transaction; creating an application writes a
-`CREATED` event. Rejected transitions write nothing.
+New applications start in `DRAFT`. Transitions are defined in `src/domain/status.ts`
+and enforced by `ApplicationRepository.transitionStatus`. Every accepted transition
+writes one `application_events` row in the same transaction; creating an application
+writes a `CREATED` event. Rejected transitions write nothing.
 
 Key rules:
 
 - `SUBMITTED` is only reachable from `APPROVED`. Never set it because a form was
   opened or filled — it must represent a real submission.
-- `FAILED` has recovery paths back to `IN_PROGRESS` / `READY_TO_APPLY`.
+- `FAILED` recovers back to `IN_PROGRESS`.
 - `REJECTED` and `REJECTED_AFTER_INTERVIEW` are terminal.
+
+## Job review / triage
+
+Review state is separate from the application lifecycle. It lives on
+`jobs.review_status` (default `NEW`) plus a `review_events` audit table, both added by
+migration v3. `src/domain/review.ts` owns `REVIEW_STATUSES` (`NEW`, `SHORTLISTED`,
+`DISMISSED`, `READY_TO_APPLY`) and the transition map; `src/repositories/jobReviews.ts`
+(`JobReviewRepository`) enforces states and appends `STATUS_CHANGED` events atomically.
+
+Transitions: `NEW` -> `SHORTLISTED` | `DISMISSED` | `READY_TO_APPLY`; `SHORTLISTED` ->
+`READY_TO_APPLY` | `DISMISSED` | `NEW`; `DISMISSED` -> `NEW` | `SHORTLISTED`;
+`READY_TO_APPLY` -> `SHORTLISTED` | `DISMISSED`. A repeated identical action is an
+idempotent no-op and writes no event. Shortlisting a job does not create an
+application; create one explicitly with `applications create <jobId>`.
+
+## Migration v3 (`review_and_lifecycle`)
+
+Append-only migration that adds `jobs.review_status`, creates `review_events`, and
+rebuilds `applications`/`application_events` to make `applications.status`
+lifecycle-only with `DEFAULT 'DRAFT'`:
+
+- Old review-style application statuses are mapped to `DRAFT`:
+  `DISCOVERED`/`MATCHED`/`REVIEW`/`READY_TO_APPLY` -> `DRAFT`. All other legacy
+  lifecycle statuses are preserved as-is.
+- Every legacy `application_events` row is copied verbatim (including old status
+  strings like `DISCOVERED`), so history is never rewritten.
+- Uses table renames (`applications_old` / `application_events_old`) inside the
+  migration transaction; this is foreign-key safe with `PRAGMA foreign_keys = ON`.
+- Tests build a v2 database, seed legacy rows, then apply `runMigrations` and assert
+  the mapping and preserved history. The migration SQL constants are exported from
+  `src/db/migrations.ts` for that test.
+
+## Relevance filter
+
+`src/scoring/relevance.ts` classifies a scored job deterministically:
+`classifyRelevance()` returns `RELEVANT` | `POSSIBLE` | `UNLIKELY` | `UNSCORED` plus a
+`nearestTargetRole` and human-readable reasons.
+
+- Verdict logic: a `HIGHPRIORITY`/`GOODMATCH` recommendation is RELEVANT; otherwise
+  both thresholds must clear for RELEVANT (`scoreTotal >= minScore` and `roleScore >=
+  minRoleScore`), exactly one threshold clears for POSSIBLE, neither for UNLIKELY, and
+  a job with no stored score is UNSCORED.
+- The role score is read from the scored `role` component; the nearest target role is
+  computed from the normalized title vs `TARGET_ROLES` via the same token/Jaccard
+  matching as scoring. Titles are never dropped for failing a literal keyword — a
+  "Senior Backend Engineer" title matches `Backend Engineer` despite lacking
+  "Software".
+- Policy defaults: `RELEVANCE_MIN_SCORE=55`, `RELEVANCE_MIN_ROLE_SCORE=25` (config,
+  CLI `--min-score` overrides the total-score threshold per run). The filter only
+  labels jobs; it never deletes or auto-applies.
 
 ## One application per job
 

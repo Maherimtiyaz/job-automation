@@ -1,5 +1,6 @@
 import { config as loadDotenv } from "dotenv";
 import { z } from "zod";
+import { DEFAULT_MIN_RELEVANCE_SCORE, DEFAULT_MIN_ROLE_SCORE } from "./scoring/relevance.js";
 
 export const DEFAULT_DATABASE_PATH = "data/job-automation.db";
 export const DEFAULT_PROFILE_PATH = "data/profile.json";
@@ -10,6 +11,12 @@ const envSchema = z.object({
   DATABASE_PATH: z.string().trim().min(1).default(DEFAULT_DATABASE_PATH),
   PROFILE_PATH: z.string().trim().min(1).default(DEFAULT_PROFILE_PATH),
   COMPANIES_PATH: z.string().trim().min(1).default(DEFAULT_COMPANIES_PATH),
+  RELEVANCE_MIN_SCORE: z.coerce
+    .number()
+    .min(0)
+    .max(100)
+    .default(DEFAULT_MIN_RELEVANCE_SCORE),
+  RELEVANCE_MIN_ROLE_SCORE: z.coerce.number().min(0).max(100).default(DEFAULT_MIN_ROLE_SCORE),
 });
 
 export type AppConfig = z.infer<typeof envSchema>;

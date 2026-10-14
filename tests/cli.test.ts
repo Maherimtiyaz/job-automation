@@ -252,3 +252,150 @@ test("jobs with no subcommand returns a usage error", async () => {
     env.cleanup();
   }
 });
+
+test("jobs review lists new jobs with a relevance verdict", async () => {
+  const env = tempEnv();
+  const captured = captureConsole();
+  try {
+    const db = openDatabase(process.env.DATABASE_PATH as string);
+    const company = new CompanyRepository(db).create({ name: "Acme" });
+    new JobRepository(db).create({
+      companyId: company.id,
+      title: "Backend Engineer",
+      url: "https://acme.test/jobs/1",
+      source: "greenhouse",
+      externalJobId: "1",
+    });
+    db.close();
+
+    captured.clear();
+    const code = await runCli(["jobs", "review"]);
+    assert.equal(code, 0);
+    const log = captured.logs.join("\n");
+    assert.ok(log.includes("Backend Engineer"));
+    assert.ok(log.includes("UNSCORED"));
+    assert.ok(log.includes("jobs shortlist"));
+  } finally {
+    captured.restore();
+    env.cleanup();
+  }
+});
+
+test("jobs shortlist/dismiss/ready/reopen transitions and history", async () => {
+  const env = tempEnv();
+  const captured = captureConsole();
+  try {
+    const db = openDatabase(process.env.DATABASE_PATH as string);
+    const company = new CompanyRepository(db).create({ name: "Acme" });
+    new JobRepository(db).create({
+      companyId: company.id,
+      title: "Backend Engineer",
+      url: "https://acme.test/jobs/1",
+      source: "greenhouse",
+      externalJobId: "1",
+    });
+    db.close();
+
+    captured.clear();
+    assert.equal(await runCli(["jobs", "shortlist", "1", "--reason", "great stack"]), 0);
+    let log = captured.logs.join("\n");
+    assert.ok(log.includes("NEW -> SHORTLISTED"));
+
+    captured.clear();
+    assert.equal(await runCli(["jobs", "ready", "1"]), 0);
+    log = captured.logs.join("\n");
+    assert.ok(log.includes("SHORTLISTED -> READY_TO_APPLY"));
+
+    captured.clear();
+    assert.equal(await runCli(["jobs", "shortlist", "1"]), 0);
+    assert.equal(await runCli(["jobs", "reopen", "1"]), 0);
+    assert.ok(captured.logs.join("\n").includes("-> NEW"));
+
+    captured.clear();
+    assert.equal(await runCli(["jobs", "review-history", "1"]), 0);
+    log = captured.logs.join("\n");
+    assert.ok(log.includes("NEW -> SHORTLISTED"));
+    assert.ok(log.includes("great stack"));
+    assert.match(log, /Review history for job 1/);
+  } finally {
+    captured.restore();
+    env.cleanup();
+  }
+});
+
+test("jobs review only shows the requested review state", async () => {
+  const env = tempEnv();
+  const captured = captureConsole();
+  try {
+    const db = openDatabase(process.env.DATABASE_PATH as string);
+    const company = new CompanyRepository(db).create({ name: "Acme" });
+    new JobRepository(db).create({
+      companyId: company.id,
+      title: "Backend Engineer",
+      url: "https://acme.test/jobs/1",
+      source: "greenhouse",
+      externalJobId: "1",
+    });
+    db.close();
+
+    await runCli(["jobs", "dismiss", "1"]);
+    captured.clear();
+    assert.equal(await runCli(["jobs", "review"]), 0);
+    assert.ok(!captured.logs.join("\n").includes("Backend Engineer"));
+
+    captured.clear();
+    assert.equal(await runCli(["jobs", "review", "--state", "DISMISSED"]), 0);
+    assert.ok(captured.logs.join("\n").includes("Backend Engineer"));
+  } finally {
+    captured.restore();
+    env.cleanup();
+  }
+});
+
+test("applications create/list/status/events workflow", async () => {
+  const env = tempEnv();
+  const captured = captureConsole();
+  try {
+    const db = openDatabase(process.env.DATABASE_PATH as string);
+    const company = new CompanyRepository(db).create({ name: "Acme" });
+    new JobRepository(db).create({
+      companyId: company.id,
+      title: "Backend Engineer",
+      url: "https://acme.test/jobs/1",
+      source: "greenhouse",
+      externalJobId: "1",
+    });
+    db.close();
+
+    captured.clear();
+    assert.equal(await runCli(["applications", "create", "1", "--notes", "v1"]), 0);
+    assert.ok(captured.logs.join("\n").includes("Created application 1"));
+
+    captured.clear();
+    assert.equal(await runCli(["applications", "list"]), 0);
+    assert.ok(captured.logs.join("\n").includes("application 1"));
+    assert.ok(captured.logs.join("\n").includes("Backend Engineer"));
+
+    captured.clear();
+    assert.equal(await runCli(["applications", "status", "1", "IN_PROGRESS"]), 0);
+    assert.ok(captured.logs.join("\n").includes("-> IN_PROGRESS"));
+
+    captured.clear();
+    assert.equal(await runCli(["applications", "show", "1"]), 0);
+    const showLog = captured.logs.join("\n");
+    assert.ok(showLog.includes("Status:   IN_PROGRESS"));
+
+    captured.clear();
+    assert.equal(await runCli(["applications", "events", "1"]), 0);
+    const eventsLog = captured.logs.join("\n");
+    assert.ok(eventsLog.includes("CREATED - -> DRAFT"));
+    assert.ok(eventsLog.includes("STATUS_CHANGED DRAFT -> IN_PROGRESS"));
+
+    captured.clear();
+    assert.equal(await runCli(["applications", "create", "1"]), 1);
+    assert.ok(captured.errors.join("\n").includes("already exists"));
+  } finally {
+    captured.restore();
+    env.cleanup();
+  }
+});

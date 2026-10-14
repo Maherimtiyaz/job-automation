@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { HttpUrlSchema } from "./normalize.js";
+import type { ReviewStatus } from "./review.js";
 
 export const EMPLOYMENT_TYPES = [
   "FULL_TIME",
@@ -83,6 +84,7 @@ export interface Job {
   salaryMax: number | null;
   salaryCurrency: string | null;
   matchScore: number | null;
+  reviewStatus: ReviewStatus;
   scoreVersion: number | null;
   scoreTotal: number | null;
   scoreCoverage: number | null;
@@ -104,4 +106,5 @@ export interface JobFilter {
   minMatchScore?: number;
   recommendation?: Recommendation;
   minScore?: number;
+  reviewStatus?: ReviewStatus;
 }

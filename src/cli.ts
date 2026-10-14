@@ -5,8 +5,12 @@ import { openDatabase } from "./db/connection.js";
 import { getDatabaseStats } from "./db/diagnostics.js";
 import { DomainError } from "./domain/errors.js";
 import type { Job } from "./domain/job.js";
+import { RECOMMENDATIONS } from "./domain/job.js";
 import { normalizeCompanyName } from "./domain/normalize.js";
 import { describeProfileGaps } from "./domain/profile.js";
+import type { CandidateProfile } from "./domain/profile.js";
+import { REVIEW_STATUSES, ReviewStatusSchema, type ReviewStatus } from "./domain/review.js";
+import { APPLICATION_STATUSES, ApplicationStatusSchema } from "./domain/status.js";
 import { ingestJobs } from "./ingest/ingest.js";
 import {
   loadProfileFromFile,
@@ -25,9 +29,12 @@ import {
   writeRegistryTemplate,
   type AtsPlatform,
 } from "./registry/companyStore.js";
+import { ApplicationRepository } from "./repositories/applications.js";
 import { CompanyRepository } from "./repositories/companies.js";
 import { JobRepository } from "./repositories/jobs.js";
+import { JobReviewRepository } from "./repositories/jobReviews.js";
 import { scoreJobs } from "./scoring/scoreJobs.js";
+import { classifyRelevance, roleScoreFromBreakdown } from "./scoring/relevance.js";
 import { createSourceRegistry } from "./sources/registry.js";
 import { SOURCE_IDS, SourceIdSchema, type SourceId } from "./sources/types.js";
 
@@ -36,6 +43,7 @@ const HELP = `job-automation
 Usage: job-automation [command] [options]
 
 Commands:
+  dashboard           Show a dashboard of review queue and application pipeline
   status              Show database and profile status (default)
   score [--force]     Score jobs that have not been scored (or all with --force)
   profile:init [--force]
@@ -51,9 +59,23 @@ Commands:
   jobs sources        List supported job sources and enabled company counts
   jobs discover [--source greenhouse|lever] [--limit N] [--dry-run] [--company NAME]
                       Fetch and ingest job listings from registered companies
-  jobs list [--limit N] [--min-score N]
+  jobs list [--limit N] [--min-score N] [--recommendation R] [--source S]
+                      [--company NAME] [--state NEW|SHORTLISTED|DISMISSED|READY_TO_APPLY]
                       List jobs, highest score first
-  jobs show <id>      Show a job and its score breakdown
+  jobs show <id>      Show a job, its score breakdown, and relevance
+  jobs review [--limit N] [--min-score N] [--state S] [--include-all]
+                      List jobs awaiting review (default review state NEW) with relevance
+  jobs shortlist <id> [--reason TEXT]
+  jobs dismiss <id> [--reason TEXT]
+  jobs ready <id>     Mark a job READY_TO_APPLY
+  jobs reopen <id>    Return a reviewed job to NEW
+  jobs review-history <id>
+                      Show the review/event history for a job
+  applications create <jobId> [--resume VERSION] [--notes TEXT]
+  applications list [--status S] [--limit N]
+  applications show <id>
+  applications status <id> <STATUS> [--message TEXT]
+  applications events <id>
   help                Show this help
 
 Options:
@@ -63,7 +85,10 @@ Options:
 Environment:
   DATABASE_PATH       SQLite database path (default: data/job-automation.db)
   PROFILE_PATH        Candidate profile JSON path (default: data/profile.json)
-  COMPANIES_PATH      Company registry JSON path (default: data/companies.json)`;
+  COMPANIES_PATH      Company registry JSON path (default: data/companies.json)
+  RELEVANCE_MIN_SCORE Min total score for a RELEVANT verdict (default: 55)
+  RELEVANCE_MIN_ROLE_SCORE
+                      Min role score for a RELEVANT verdict (default: 25)`;
 
 interface ParsedArgs {
   flags: Record<string, string | true>;
@@ -128,6 +153,8 @@ export async function runCli(argv: readonly string[]): Promise<number> {
 
   try {
     switch (command) {
+      case "dashboard":
+        return await runDashboard();
       case "status":
         return await runStatus();
       case "score":
@@ -146,6 +173,8 @@ export async function runCli(argv: readonly string[]): Promise<number> {
         return await runCompaniesSetActive(rest, false);
       case "jobs":
         return await runJobs(rest);
+      case "applications":
+        return await runApplications(rest);
       case "help":
       case "--help":
       case "-h":
@@ -181,6 +210,9 @@ async function runStatus(): Promise<number> {
   return withDatabase((db, config) => {
     const stats = getDatabaseStats(db);
     const jobs = new JobRepository(db);
+    const reviews = new JobReviewRepository(db);
+    const reviewSummary = reviews.summary();
+    const applications = new ApplicationRepository(db);
 
     console.log(`Database: ${config.DATABASE_PATH} (schema v${stats.schemaVersion})`);
     console.log(
@@ -188,6 +220,76 @@ async function runStatus(): Promise<number> {
         `applications=${stats.applications} events=${stats.applicationEvents}`,
     );
     console.log(`Scored jobs: ${jobs.countScored()}/${stats.jobs}`);
+
+    const reviewCounts = REVIEW_STATUSES.map((status) => `${status}=${reviewSummary.byStatus[status]}`);
+    console.log(`Review queue: ${reviewCounts.join("  ")}`);
+
+    const lifecycleCounts = applications.countByStatus();
+    const lifecycleLine = APPLICATION_STATUSES.filter((status) => (lifecycleCounts[status] ?? 0) > 0)
+      .map((status) => `${status}=${lifecycleCounts[status] ?? 0}`)
+      .join("  ");
+    console.log(`Applications: ${lifecycleLine === "" ? "none" : lifecycleLine}`);
+
+    printProfileStatus(config.PROFILE_PATH);
+    return 0;
+  });
+}
+
+async function runDashboard(): Promise<number> {
+  return withDatabase((db, config) => {
+    const jobs = new JobRepository(db);
+    const reviews = new JobReviewRepository(db);
+    const applications = new ApplicationRepository(db);
+    const companies = new CompanyRepository(db);
+    const reviewSummary = reviews.summary();
+
+    console.log(`Job automation dashboard (${config.DATABASE_PATH})\n`);
+
+    console.log("Review queue:");
+    for (const status of REVIEW_STATUSES) {
+      const rows = status === "NEW" ? reviews.listByStatus(status) : [];
+      const count = reviewSummary.byStatus[status];
+      console.log(`  ${status}: ${count}`);
+      if (status === "NEW") {
+        for (const job of rows.slice(0, 5)) {
+          const company = companies.findById(job.companyId);
+          const score = job.scoreTotal === null ? "-" : String(job.scoreTotal);
+          console.log(
+            `    job ${job.id}: [${score}] ${company?.name ?? String(job.companyId)} (${job.source}) "${job.title}"`,
+          );
+        }
+        if (rows.length > 5) {
+          console.log(`    ... and ${rows.length - 5} more`);
+        }
+      }
+    }
+
+    console.log("");
+    console.log("Application pipeline:");
+    const lifecycleCounts = applications.countByStatus();
+    for (const status of APPLICATION_STATUSES) {
+      console.log(
+        `  ${status}: ${lifecycleCounts[status] ?? 0}`,
+      );
+    }
+
+    const needsAttention = applications
+      .list()
+      .filter((app) => app.status === "WAITING_FOR_HUMAN" || app.status === "SUBMITTED");
+    console.log("");
+    console.log("Needs attention:");
+    if (needsAttention.length === 0) {
+      console.log("  none");
+    } else {
+      for (const app of needsAttention.slice(0, 5)) {
+        const job = jobs.findById(app.jobId);
+        console.log(
+          `  application ${app.id} [${app.status}]: ${job?.title ?? `job ${app.jobId}`}`,
+        );
+      }
+    }
+
+    console.log("");
     printProfileStatus(config.PROFILE_PATH);
     return 0;
   });
@@ -354,9 +456,23 @@ async function runJobs(argv: readonly string[]): Promise<number> {
       return await runJobsList(rest);
     case "show":
       return await runJobsShow(rest);
+    case "review":
+      return await runJobsReview(rest);
+    case "shortlist":
+      return await runJobsTransition(rest, "SHORTLISTED");
+    case "dismiss":
+      return await runJobsTransition(rest, "DISMISSED");
+    case "ready":
+      return await runJobsTransition(rest, "READY_TO_APPLY");
+    case "reopen":
+      return await runJobsTransition(rest, "NEW");
+    case "review-history":
+      return await runJobsReviewHistory(rest);
     default:
       if (subcommand === "") {
-        console.error("Error: missing jobs subcommand (sources | discover | list | show).");
+        console.error(
+          "Error: missing jobs subcommand (sources | discover | list | show | review | shortlist | dismiss | ready | reopen | review-history).",
+        );
         return 1;
       }
       console.error(`Unknown jobs subcommand: ${subcommand}`);
@@ -505,12 +621,49 @@ async function runJobsList(argv: readonly string[]): Promise<number> {
   const parsed = parseArgs(argv);
   const limit = readIntFlag(parsed, "limit", 0) ?? 25;
   const minScore = readIntFlag(parsed, "min-score");
+  const recommendation = readFlag(parsed, "recommendation");
+  const source = readFlag(parsed, "source");
+  const state = readFlag(parsed, "state");
+  const companyFilter = readFlag(parsed, "company");
+
+  if (recommendation !== undefined) {
+    if (!RECOMMENDATIONS.includes(recommendation as import("./domain/job.js").Recommendation)) {
+      console.error(`Error: --recommendation must be one of: ${RECOMMENDATIONS.join(", ")}.`);
+      return 1;
+    }
+  }
+  if (state !== undefined && !ReviewStatusSchema.safeParse(state).success) {
+    console.error(`Error: --state must be one of: ${REVIEW_STATUSES.join(", ")}.`);
+    return 1;
+  }
 
   return withDatabase((db) => {
     const jobs = new JobRepository(db);
     const companies = new CompanyRepository(db);
 
-    const all = minScore !== undefined ? jobs.list({ minScore }) : jobs.list();
+    const filter: import("./domain/job.js").JobFilter = {};
+    if (minScore !== undefined) {
+      filter.minScore = minScore;
+    }
+    if (recommendation !== undefined) {
+      filter.recommendation = recommendation as import("./domain/job.js").Recommendation;
+    }
+    if (source !== undefined) {
+      filter.source = source;
+    }
+    if (state !== undefined) {
+      filter.reviewStatus = state as ReviewStatus;
+    }
+    if (companyFilter !== undefined) {
+      const company = companies.findByNormalizedName(normalizeCompanyName(companyFilter));
+      if (company === null) {
+        console.error(`Error: no company named "${companyFilter}".`);
+        return 1;
+      }
+      filter.companyId = company.id;
+    }
+
+    const all = jobs.list(filter);
     const sorted = [...all].sort((left, right) => {
       const leftScore = left.scoreTotal ?? -1;
       const rightScore = right.scoreTotal ?? -1;
@@ -526,15 +679,165 @@ async function runJobsList(argv: readonly string[]): Promise<number> {
       return 0;
     }
 
-    console.log(
-      `Found ${all.length} job(s)${minScore !== undefined ? ` with score >= ${minScore}` : ""}, ` +
-        `showing ${items.length}:`,
-    );
+    const label = summarizeJobFilter(filter);
+    console.log(`Found ${all.length} job(s)${label}, showing ${items.length}:`);
     for (const job of items) {
       const company = companies.findById(job.companyId);
       const score = job.scoreTotal === null ? "-" : String(job.scoreTotal);
       console.log(
-        `  job ${job.id}: [${score}] ${company?.name ?? String(job.companyId)} (${job.source}) "${job.title}"`,
+        `  job ${job.id}: [${score}] ${company?.name ?? String(job.companyId)} (${job.source}) "${job.title}"` +
+          ` [${job.reviewStatus}]`,
+      );
+    }
+    return 0;
+  });
+}
+
+function summarizeJobFilter(filter: import("./domain/job.js").JobFilter): string {
+  const parts: string[] = [];
+  if (filter.minScore !== undefined) {
+    parts.push(`score >= ${filter.minScore}`);
+  }
+  if (filter.recommendation !== undefined) {
+    parts.push(`recommendation ${filter.recommendation}`);
+  }
+  if (filter.source !== undefined) {
+    parts.push(`source ${filter.source}`);
+  }
+  if (filter.reviewStatus !== undefined) {
+    parts.push(`state ${filter.reviewStatus}`);
+  }
+  if (filter.companyId !== undefined) {
+    parts.push(`company ${filter.companyId}`);
+  }
+  return parts.length === 0 ? "" : ` with ${parts.join(", ")}`;
+}
+
+async function runJobsReview(argv: readonly string[]): Promise<number> {
+  const parsed = parseArgs(argv);
+  const limit = readIntFlag(parsed, "limit", 0) ?? 20;
+  const minScore = readIntFlag(parsed, "min-score");
+  const includeAll = parsed.flags["include-all"] === true;
+  const stateFlag = readFlag(parsed, "state");
+
+  const state = stateFlag ?? (includeAll ? undefined : "NEW");
+  if (state !== undefined && !ReviewStatusSchema.safeParse(state).success) {
+    console.error(`Error: --state must be one of: ${REVIEW_STATUSES.join(", ")}.`);
+    return 1;
+  }
+
+  return withDatabase((db, config) => {
+    const jobs = new JobRepository(db);
+    const companies = new CompanyRepository(db);
+    const profile = profileExists(config.PROFILE_PATH)
+      ? loadProfileFromFile(config.PROFILE_PATH)
+      : null;
+    const policy = relevancePolicy(config);
+
+    const filter: import("./domain/job.js").JobFilter = {};
+    if (minScore !== undefined) {
+      filter.minScore = minScore;
+    }
+    if (state !== undefined) {
+      filter.reviewStatus = state as ReviewStatus;
+    }
+    const sorted = [...jobs.list(filter)].sort((left, right) => {
+      const leftScore = left.scoreTotal ?? -1;
+      const rightScore = right.scoreTotal ?? -1;
+      if (rightScore !== leftScore) {
+        return rightScore - leftScore;
+      }
+      return right.discoveredAt.localeCompare(left.discoveredAt);
+    });
+    const relevanceEntries = sorted.map((job) => {
+      const result = describeRelevance(jobs, job, profile, policy);
+      const company = companies.findById(job.companyId);
+      return `  job ${job.id}: [${result.score}] ${result.verdict.padEnd(8)} ` +
+        `${company?.name ?? String(job.companyId)} (${job.source}) "${job.title}" [${job.reviewStatus}]`;
+    });
+
+    if (relevanceEntries.length === 0) {
+      console.log(
+        `No jobs awaiting review${minScore !== undefined ? ` with score >= ${minScore}` : ""}.`,
+      );
+      return 0;
+    }
+
+    const header = includeAll
+      ? `Review overview (${sorted.length} job(s)):`
+      : `Review queue (${sorted.length} awaiting review):`;
+    console.log(header);
+    for (const line of relevanceEntries.slice(0, limit)) {
+      console.log(line);
+    }
+    if (relevanceEntries.length > limit) {
+      console.log(`  ... and ${relevanceEntries.length - limit} more (use --limit N)`);
+    }
+    console.log("");
+    console.log(
+      "Use: jobs shortlist <id> [--reason TEXT], jobs dismiss <id> [--reason TEXT], jobs ready <id>.",
+    );
+    return 0;
+  });
+}
+
+async function runJobsTransition(
+  argv: readonly string[],
+  target: ReviewStatus,
+): Promise<number> {
+  const parsed = parseArgs(argv);
+  const id = Number(parsed.positionals[0]);
+  if (!Number.isSafeInteger(id) || id <= 0) {
+    console.error("Error: a positive job id is required (e.g. jobs shortlist 3).");
+    return 1;
+  }
+  const reason = readFlag(parsed, "reason");
+
+  return withDatabase((db) => {
+    const reviews = new JobReviewRepository(db);
+    const companies = new CompanyRepository(db);
+    const jobs = new JobRepository(db);
+
+    const before = jobs.getById(id);
+    const after = reviews.transitionStatus(id, target, {
+      ...(reason !== undefined ? { reason } : {}),
+    });
+
+    if (before.reviewStatus === after.reviewStatus) {
+      console.log(`job ${id} is already ${after.reviewStatus} (no change).`);
+      return 0;
+    }
+
+    const company = companies.findById(after.companyId);
+    console.log(
+      `job ${id}: ${before.reviewStatus} -> ${after.reviewStatus}` +
+        ` (${company?.name ?? String(after.companyId)} "${after.title}")` +
+        (reason !== undefined ? ` reason="${reason}"` : ""),
+    );
+    return 0;
+  });
+}
+
+async function runJobsReviewHistory(argv: readonly string[]): Promise<number> {
+  const parsed = parseArgs(argv);
+  const id = Number(parsed.positionals[0]);
+  if (!Number.isSafeInteger(id) || id <= 0) {
+    console.error("Error: a positive job id is required (e.g. jobs review-history 3).");
+    return 1;
+  }
+
+  return withDatabase((db) => {
+    const reviews = new JobReviewRepository(db);
+    const events = reviews.getReviewHistory(id);
+    console.log(`Review history for job ${id} (${events.length} event(s)):`);
+    if (events.length === 0) {
+      console.log("  (none - job has not been reviewed yet)");
+    }
+    for (const event of events) {
+      const from = event.previousStatus ?? "-";
+      const reason = event.reason !== null ? ` (${event.reason})` : "";
+      console.log(
+        `  #${event.id} ${event.createdAt}: ${from} -> ${event.newStatus}${reason}`,
       );
     }
     return 0;
@@ -549,12 +852,17 @@ async function runJobsShow(argv: readonly string[]): Promise<number> {
     return 1;
   }
 
-  return withDatabase((db) => {
+  return withDatabase((db, config) => {
     const jobs = new JobRepository(db);
     const companies = new CompanyRepository(db);
 
     const job = jobs.getById(id);
     const company = companies.findById(job.companyId);
+    const profile = profileExists(config.PROFILE_PATH)
+      ? loadProfileFromFile(config.PROFILE_PATH)
+      : null;
+    const policy = relevancePolicy(config);
+    const relevance = describeRelevance(jobs, job, profile, policy);
 
     console.log(`Job ${job.id}: ${job.title}`);
     console.log(`  Company:    ${company?.name ?? String(job.companyId)}`);
@@ -565,6 +873,11 @@ async function runJobsShow(argv: readonly string[]): Promise<number> {
     console.log(`  Location:   ${job.location ?? "-"}`);
     console.log(`  Type:       ${job.employmentType ?? "-"} (${job.workplaceType})`);
     console.log(`  Salary:     ${formatSalary(job)}`);
+    console.log(`  Review:     ${job.reviewStatus}`);
+    console.log(`  Relevance:  ${relevance.verdict}${relevance.nearestTargetRole ? ` (nearest ${relevance.nearestTargetRole})` : ""}`);
+    for (const reason of relevance.reasons) {
+      console.log(`              - ${reason}`);
+    }
     console.log(`  Discovered: ${job.discoveredAt}`);
     console.log(`  Last seen:  ${job.lastSeenAt}`);
     console.log(
@@ -581,6 +894,235 @@ async function runJobsShow(argv: readonly string[]): Promise<number> {
       for (const reason of breakdown.reasons) {
         console.log(`    ${reason.component.padEnd(14)} ${reason.message}`);
       }
+    }
+    return 0;
+  });
+}
+
+function relevancePolicy(config: AppConfig): {
+  minScore: number;
+  minRoleScore: number;
+} {
+  return {
+    minScore: config.RELEVANCE_MIN_SCORE,
+    minRoleScore: config.RELEVANCE_MIN_ROLE_SCORE,
+  };
+}
+
+function describeRelevance(
+  jobs: JobRepository,
+  job: Job,
+  profile: CandidateProfile | null,
+  policy: { minScore: number; minRoleScore: number },
+): RelevanceDisplay {
+  const breakdown = jobs.getScoreBreakdown(job.id);
+  const roleScore = roleScoreFromBreakdown(breakdown);
+  const targetRoles = profile !== null ? profile.targetRoles.map((entry) => entry.role) : [];
+  const result = classifyRelevance(
+    {
+      title: job.title,
+      scoreTotal: job.scoreTotal,
+      roleScore,
+      recommendation: job.scoreRecommendation,
+      targetRoles,
+    },
+    policy,
+  );
+  const score = job.scoreTotal === null ? "-" : String(job.scoreTotal);
+  return {
+    score,
+    verdict: result.verdict,
+    nearestTargetRole: result.nearestTargetRole,
+    reasons: result.reasons,
+  };
+}
+
+interface RelevanceDisplay {
+  score: string;
+  verdict: string;
+  nearestTargetRole: string | null;
+  reasons: string[];
+}
+
+async function runApplications(argv: readonly string[]): Promise<number> {
+  const [subcommand = "", ...rest] = argv;
+
+  switch (subcommand) {
+    case "create":
+      return await runApplicationCreate(rest);
+    case "list":
+      return await runApplicationList(rest);
+    case "show":
+      return await runApplicationShow(rest);
+    case "status":
+      return await runApplicationStatus(rest);
+    case "events":
+      return await runApplicationEvents(rest);
+    default:
+      if (subcommand === "") {
+        console.error(
+          "Error: missing applications subcommand (create | list | show | status | events).",
+        );
+        return 1;
+      }
+      console.error(`Unknown applications subcommand: ${subcommand}`);
+      return 1;
+  }
+}
+
+async function runApplicationCreate(argv: readonly string[]): Promise<number> {
+  const parsed = parseArgs(argv);
+  const jobId = Number(parsed.positionals[0]);
+  if (!Number.isSafeInteger(jobId) || jobId <= 0) {
+    console.error("Error: applications create requires a positive job id (e.g. applications create 5).");
+    return 1;
+  }
+
+  const resumeVersion = readFlag(parsed, "resume");
+  const notes = readFlag(parsed, "notes");
+
+  return withDatabase((db) => {
+    const jobs = new JobRepository(db);
+    const applications = new ApplicationRepository(db);
+    const companies = new CompanyRepository(db);
+
+    const job = jobs.getById(jobId);
+    const application = applications.create({
+      jobId,
+      ...(resumeVersion !== undefined ? { resumeVersion } : {}),
+      ...(notes !== undefined ? { notes } : {}),
+    });
+    const company = companies.findById(job.companyId);
+    console.log(
+      `Created application ${application.id} for job ${jobId} "${job.title}" ` +
+        `(${company?.name ?? String(job.companyId)}) [status ${application.status}].`,
+    );
+    return 0;
+  });
+}
+
+async function runApplicationList(argv: readonly string[]): Promise<number> {
+  const parsed = parseArgs(argv);
+  const limit = readIntFlag(parsed, "limit", 0) ?? 25;
+  const statusFlag = readFlag(parsed, "status");
+
+  if (statusFlag !== undefined && !ApplicationStatusSchema.safeParse(statusFlag).success) {
+    console.error(`Error: --status must be one of: ${APPLICATION_STATUSES.join(", ")}.`);
+    return 1;
+  }
+
+  return withDatabase((db) => {
+    const applications = new ApplicationRepository(db);
+    const jobs = new JobRepository(db);
+    const companies = new CompanyRepository(db);
+
+    const all = statusFlag !== undefined ? applications.listByStatus(statusFlag as import("./domain/status.js").ApplicationStatus) : applications.list();
+    const sorted = [...all].sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+    const items = sorted.slice(0, limit);
+
+    if (items.length === 0) {
+      console.log(
+        `No applications found${statusFlag !== undefined ? ` with status ${statusFlag}` : ""}.`,
+      );
+      return 0;
+    }
+
+    console.log(
+      `Found ${all.length} application(s)${statusFlag !== undefined ? ` with status ${statusFlag}` : ""}, ` +
+        `showing ${items.length}:`,
+    );
+    for (const app of items) {
+      const job = jobs.findById(app.jobId);
+      const company = job !== null ? companies.findById(job.companyId) : undefined;
+      const companyLabel = company?.name ?? (job ? String(job.companyId) : "?");
+      console.log(
+        `  application ${app.id}: [${app.status.padEnd(8)}] job ${app.jobId} ` +
+          `${companyLabel} ${job?.title ?? ""}`.trim(),
+      );
+    }
+    return 0;
+  });
+}
+
+function printApplication(
+  jobs: JobRepository,
+  companies: CompanyRepository,
+  app: import("./domain/application.js").Application,
+): void {
+  const job = jobs.findById(app.jobId);
+  const company = job !== null ? companies.findById(job.companyId) : undefined;
+  console.log(`Application ${app.id}:`);
+  console.log(`  Job:      ${job?.title ?? `#${app.jobId}`} at ${company?.name ?? ""}`);
+  console.log(`  Status:   ${app.status}`);
+  console.log(`  Created:  ${app.createdAt}`);
+  console.log(`  Updated:  ${app.lastUpdatedAt}`);
+  console.log(`  Resume:   ${app.resumeVersion ?? "-"}`);
+  console.log(`  Notes:    ${app.notes ?? "-"}`);
+}
+
+async function runApplicationShow(argv: readonly string[]): Promise<number> {
+  const parsed = parseArgs(argv);
+  const id = Number(parsed.positionals[0]);
+  if (!Number.isSafeInteger(id) || id <= 0) {
+    console.error("Error: applications show requires a positive application id (e.g. applications show 1).");
+    return 1;
+  }
+
+  return withDatabase((db) => {
+    const applications = new ApplicationRepository(db);
+    const jobs = new JobRepository(db);
+    const companies = new CompanyRepository(db);
+    const app = applications.getById(id);
+    printApplication(jobs, companies, app);
+    return 0;
+  });
+}
+
+async function runApplicationStatus(argv: readonly string[]): Promise<number> {
+  const parsed = parseArgs(argv);
+  const id = Number(parsed.positionals[0]);
+  if (!Number.isSafeInteger(id) || id <= 0) {
+    console.error("Error: applications status requires a positive application id (e.g. applications status 2 APPROVED).");
+    return 1;
+  }
+
+  const status = parsed.positionals[1];
+  const parsedStatus = ApplicationStatusSchema.safeParse(status);
+  if (!parsedStatus.success) {
+    console.error(`Error: status must be one of: ${APPLICATION_STATUSES.join(", ")}.`);
+    return 1;
+  }
+
+  const message = readFlag(parsed, "message");
+
+  return withDatabase((db) => {
+    const applications = new ApplicationRepository(db);
+    const app = applications.transitionStatus(id, parsedStatus.data, {
+      ...(message !== undefined ? { message } : {}),
+    });
+    console.log(`application ${id}: -> ${app.status}`);
+    return 0;
+  });
+}
+
+async function runApplicationEvents(argv: readonly string[]): Promise<number> {
+  const parsed = parseArgs(argv);
+  const id = Number(parsed.positionals[0]);
+  if (!Number.isSafeInteger(id) || id <= 0) {
+    console.error("Error: applications events requires a positive application id (e.g. applications events 1).");
+    return 1;
+  }
+
+  return withDatabase((db) => {
+    const applications = new ApplicationRepository(db);
+    const events = applications.getEventHistory(id);
+    console.log(`Events for application ${id} (${events.length} event(s)):`);
+    for (const event of events) {
+      const from = event.previousStatus ?? "-";
+      const message = event.message !== null ? ` (${event.message})` : "";
+      console.log(
+        `  #${event.id} ${event.createdAt}: ${event.eventType} ${from} -> ${event.newStatus}${message}`,
+      );
     }
     return 0;
   });

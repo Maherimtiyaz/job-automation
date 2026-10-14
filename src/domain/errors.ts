@@ -1,5 +1,4 @@
 import type { ZodError } from "zod";
-import type { ApplicationStatus } from "./status.js";
 
 export class DomainError extends Error {
   constructor(message: string) {
@@ -40,11 +39,11 @@ export class ConflictError extends DomainError {
 }
 
 export class InvalidStatusTransitionError extends DomainError {
-  readonly from: ApplicationStatus;
-  readonly to: ApplicationStatus;
+  readonly from: string;
+  readonly to: string;
 
-  constructor(from: ApplicationStatus, to: ApplicationStatus) {
-    super(`Invalid application status transition: ${from} -> ${to}`);
+  constructor(from: string, to: string) {
+    super(`Invalid status transition: ${from} -> ${to}`);
     this.name = "InvalidStatusTransitionError";
     this.from = from;
     this.to = to;

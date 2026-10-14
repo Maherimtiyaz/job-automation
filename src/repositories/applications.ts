@@ -75,7 +75,7 @@ export class ApplicationRepository {
     const run = this.db.transaction(() => {
       const result = insert.run({
         jobId,
-        status: "DISCOVERED",
+        status: "DRAFT",
         resumeVersion: parsed.data.resumeVersion ?? null,
         lastUpdatedAt: timestamp,
         notes: parsed.data.notes ?? null,
@@ -86,7 +86,7 @@ export class ApplicationRepository {
         applicationId,
         eventType: "CREATED",
         previousStatus: null,
-        newStatus: "DISCOVERED",
+        newStatus: "DRAFT",
         message: null,
       });
       return applicationId;
@@ -162,6 +162,24 @@ export class ApplicationRepository {
       .prepare("SELECT * FROM applications WHERE status = ? ORDER BY last_updated_at DESC, id DESC")
       .all(status) as ApplicationRow[];
     return rows.map(mapApplication);
+  }
+
+  list(): Application[] {
+    const rows = this.db
+      .prepare("SELECT * FROM applications ORDER BY last_updated_at DESC, id DESC")
+      .all() as ApplicationRow[];
+    return rows.map(mapApplication);
+  }
+
+  countByStatus(): Partial<Record<ApplicationStatus, number>> {
+    const rows = this.db
+      .prepare("SELECT status, COUNT(*) AS count FROM applications GROUP BY status")
+      .all() as { status: string; count: number }[];
+    const counts: Partial<Record<ApplicationStatus, number>> = {};
+    for (const row of rows) {
+      counts[row.status as ApplicationStatus] = row.count;
+    }
+    return counts;
   }
 
   getEventHistory(applicationId: number): ApplicationEvent[] {

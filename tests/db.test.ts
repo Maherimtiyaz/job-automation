@@ -3,9 +3,18 @@ import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import Database from "better-sqlite3";
 import type { Db } from "../src/db/connection.js";
 import { openDatabase } from "../src/db/connection.js";
-import { getLatestSchemaVersion, MIGRATIONS } from "../src/db/migrations.js";
+import {
+  getLatestSchemaVersion,
+  INITIAL_SCHEMA,
+  MIGRATIONS,
+  runMigrations,
+  SCHEMA_MIGRATIONS_TABLE,
+  SCORING_COLUMNS,
+} from "../src/db/migrations.js";
+import { nowIso } from "../src/domain/time.js";
 import { seedCompanyAndJob } from "./support/db.js";
 
 function tableNames(db: Db): Set<string> {
@@ -106,13 +115,89 @@ test("enforces the application status check constraint", () => {
     const { jobId } = seedCompanyAndJob(db);
     db.prepare(
       `INSERT INTO applications (job_id, status, last_updated_at, created_at)
-       VALUES (?, 'DISCOVERED', 't', 't')`,
+       VALUES (?, 'DRAFT', 't', 't')`,
     ).run(jobId);
 
     assert.throws(
       () => db.prepare("UPDATE applications SET status = 'BOGUS'").run(),
       /CHECK/i,
     );
+  } finally {
+    db.close();
+  }
+});
+
+test("migration v3 maps legacy application statuses and preserves history", () => {
+  const db = new Database(":memory:");
+  try {
+    db.pragma("foreign_keys = ON");
+    db.exec(SCHEMA_MIGRATIONS_TABLE);
+    db.exec(INITIAL_SCHEMA);
+    db.exec(SCORING_COLUMNS);
+    for (const migration of MIGRATIONS) {
+      if (migration.version > 2) {
+        continue;
+      }
+      db.prepare("INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)").run(
+        migration.version,
+        migration.name,
+        nowIso(),
+      );
+    }
+
+    db.exec(
+      "INSERT INTO companies (name, normalized_name, created_at, updated_at) VALUES ('PreserveCo', 'preserveco', 't', 't')",
+    );
+    db.prepare(
+      "INSERT INTO jobs (company_id, title, canonical_url, dedupe_key, source, workplace_type, discovered_at, last_seen_at, created_at, updated_at) VALUES (1, 'Legacy Role', 'https://preserveco.test/1', 'url:https://preserveco.test/1', 'test', 'unknown', 't', 't', 't', 't')",
+    ).run();
+    const reviewJobId = 1;
+    const readyJobId = 2;
+
+    db.prepare(
+      "INSERT INTO jobs (company_id, title, canonical_url, dedupe_key, source, workplace_type, discovered_at, last_seen_at, created_at, updated_at) VALUES (1, 'Ready Role', 'https://preserveco.test/2', 'url:https://preserveco.test/2', 'test', 'unknown', 't', 't', 't', 't')",
+    ).run();
+
+    db.prepare(
+      "INSERT INTO applications (job_id, status, last_updated_at, notes, created_at) VALUES (?, 'REVIEW', 't', 'keep me', 't')",
+    ).run(reviewJobId);
+    const reviewAppId = Number(
+      (db.prepare("SELECT last_insert_rowid() AS id").get() as { id: number }).id,
+    );
+    db.prepare(
+      "INSERT INTO application_events (application_id, event_type, previous_status, new_status, message, created_at) VALUES (?, 'STATUS_CHANGED', 'DISCOVERED', 'REVIEW', 'legacy', 't')",
+    ).run(reviewAppId);
+
+    db.prepare(
+      "INSERT INTO applications (job_id, status, last_updated_at, notes, created_at) VALUES (?, 'SUBMITTED', 't', 'keep me too', 't')",
+    ).run(readyJobId);
+    const submittedAppId = Number(
+      (db.prepare("SELECT last_insert_rowid() AS id").get() as { id: number }).id,
+    );
+
+    const applied = runMigrations(db);
+    assert.deepEqual([...applied], [3]);
+
+    const mapped = db.prepare("SELECT status FROM applications WHERE id = ?").get(reviewAppId) as {
+      status: string;
+    };
+    assert.equal(mapped.status, "DRAFT");
+    const preserved = db
+      .prepare("SELECT status, notes FROM applications WHERE id = ?")
+      .get(submittedAppId) as { status: string; notes: string };
+    assert.equal(preserved.status, "SUBMITTED");
+    assert.equal(preserved.notes, "keep me too");
+
+    const event = db
+      .prepare("SELECT previous_status, new_status FROM application_events WHERE application_id = ?")
+      .get(reviewAppId) as { previous_status: string; new_status: string };
+    assert.equal(event.previous_status, "DISCOVERED");
+    assert.equal(event.new_status, "REVIEW");
+
+    const reviewStatus = db
+      .prepare("SELECT review_status FROM jobs WHERE id = ?")
+      .get(reviewJobId) as { review_status: string };
+    assert.equal(reviewStatus.review_status, "NEW");
   } finally {
     db.close();
   }

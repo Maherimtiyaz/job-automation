@@ -7,7 +7,7 @@ export interface Migration {
   readonly up: (db: Db) => void;
 }
 
-const INITIAL_SCHEMA = `
+export const INITIAL_SCHEMA = `
 CREATE TABLE companies (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT NOT NULL,
@@ -103,7 +103,90 @@ CREATE INDEX idx_applications_status ON applications (status);
 CREATE INDEX idx_application_events_application_id ON application_events (application_id);
 `;
 
-const SCORING_COLUMNS = `
+export const REVIEW_AND_LIFECYCLE = `
+ALTER TABLE jobs ADD COLUMN review_status TEXT NOT NULL DEFAULT 'NEW'
+  CHECK (review_status IN ('NEW', 'SHORTLISTED', 'DISMISSED', 'READY_TO_APPLY'));
+
+CREATE TABLE review_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+  event_type TEXT NOT NULL,
+  previous_status TEXT,
+  new_status TEXT NOT NULL,
+  reason TEXT,
+  created_at TEXT NOT NULL,
+  CONSTRAINT review_events_type_valid CHECK (
+    event_type IN ('STATUS_CHANGED')
+  )
+);
+
+CREATE INDEX idx_jobs_review_status ON jobs (review_status);
+CREATE INDEX idx_review_events_job_id ON review_events (job_id);
+
+ALTER TABLE applications RENAME TO applications_old;
+ALTER TABLE application_events RENAME TO application_events_old;
+
+CREATE TABLE applications (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+  status TEXT NOT NULL DEFAULT 'DRAFT',
+  resume_version TEXT,
+  started_at TEXT,
+  submitted_at TEXT,
+  last_updated_at TEXT NOT NULL,
+  notes TEXT,
+  created_at TEXT NOT NULL,
+  CONSTRAINT applications_job_id_unique UNIQUE (job_id),
+  CONSTRAINT applications_status_valid CHECK (
+    status IN (
+      'DRAFT', 'IN_PROGRESS', 'WAITING_FOR_HUMAN', 'APPROVED', 'SUBMITTED',
+      'FAILED', 'WITHDRAWN', 'REJECTED', 'INTERVIEW', 'OFFER',
+      'REJECTED_AFTER_INTERVIEW'
+    )
+  )
+);
+
+INSERT INTO applications (id, job_id, status, resume_version, started_at, submitted_at, last_updated_at, notes, created_at)
+SELECT
+  id,
+  job_id,
+  CASE
+    WHEN status IN ('DISCOVERED', 'MATCHED', 'REVIEW', 'READY_TO_APPLY') THEN 'DRAFT'
+    ELSE status
+  END,
+  resume_version,
+  started_at,
+  submitted_at,
+  last_updated_at,
+  notes,
+  created_at
+FROM applications_old;
+
+CREATE TABLE application_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  application_id INTEGER NOT NULL REFERENCES applications(id) ON DELETE CASCADE,
+  event_type TEXT NOT NULL,
+  previous_status TEXT,
+  new_status TEXT,
+  message TEXT,
+  created_at TEXT NOT NULL,
+  CONSTRAINT application_events_type_valid CHECK (
+    event_type IN ('CREATED', 'STATUS_CHANGED')
+  )
+);
+
+INSERT INTO application_events (id, application_id, event_type, previous_status, new_status, message, created_at)
+SELECT id, application_id, event_type, previous_status, new_status, message, created_at
+FROM application_events_old;
+
+DROP TABLE application_events_old;
+DROP TABLE applications_old;
+
+CREATE INDEX idx_applications_status ON applications (status);
+CREATE INDEX idx_application_events_application_id ON application_events (application_id);
+`;
+
+export const SCORING_COLUMNS = `
 ALTER TABLE jobs ADD COLUMN score_version INTEGER;
 ALTER TABLE jobs ADD COLUMN score_total REAL
   CHECK (score_total IS NULL OR (score_total >= 0 AND score_total <= 100));
@@ -138,9 +221,16 @@ export const MIGRATIONS: readonly Migration[] = [
       db.exec(SCORING_COLUMNS);
     },
   },
+  {
+    version: 3,
+    name: "review_and_lifecycle",
+    up: (db) => {
+      db.exec(REVIEW_AND_LIFECYCLE);
+    },
+  },
 ];
 
-const MIGRATIONS_TABLE = `
+export const SCHEMA_MIGRATIONS_TABLE = `
 CREATE TABLE IF NOT EXISTS schema_migrations (
   version INTEGER PRIMARY KEY,
   name TEXT NOT NULL,
@@ -149,7 +239,7 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 `;
 
 export function runMigrations(db: Db): readonly number[] {
-  db.exec(MIGRATIONS_TABLE);
+  db.exec(SCHEMA_MIGRATIONS_TABLE);
 
   const appliedRows = db
     .prepare("SELECT version FROM schema_migrations")

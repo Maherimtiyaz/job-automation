@@ -2,10 +2,7 @@ import { z } from "zod";
 import { InvalidStatusTransitionError } from "./errors.js";
 
 export const APPLICATION_STATUSES = [
-  "DISCOVERED",
-  "MATCHED",
-  "REVIEW",
-  "READY_TO_APPLY",
+  "DRAFT",
   "IN_PROGRESS",
   "WAITING_FOR_HUMAN",
   "APPROVED",
@@ -29,16 +26,13 @@ export type ApplicationEventType = (typeof APPLICATION_EVENT_TYPES)[number];
 export const ApplicationEventTypeSchema = z.enum(APPLICATION_EVENT_TYPES);
 
 const TRANSITIONS: Record<ApplicationStatus, readonly ApplicationStatus[]> = {
-  DISCOVERED: ["MATCHED"],
-  MATCHED: ["REVIEW", "WITHDRAWN"],
-  REVIEW: ["READY_TO_APPLY", "WITHDRAWN"],
-  READY_TO_APPLY: ["IN_PROGRESS", "WITHDRAWN"],
+  DRAFT: ["IN_PROGRESS", "WITHDRAWN"],
   IN_PROGRESS: ["WAITING_FOR_HUMAN", "APPROVED", "FAILED", "WITHDRAWN"],
   WAITING_FOR_HUMAN: ["IN_PROGRESS", "WITHDRAWN"],
   APPROVED: ["SUBMITTED", "IN_PROGRESS", "WITHDRAWN"],
   SUBMITTED: ["INTERVIEW", "REJECTED", "FAILED", "WITHDRAWN"],
-  FAILED: ["IN_PROGRESS", "READY_TO_APPLY", "WITHDRAWN"],
-  WITHDRAWN: ["REVIEW"],
+  FAILED: ["IN_PROGRESS", "WITHDRAWN"],
+  WITHDRAWN: ["DRAFT"],
   INTERVIEW: ["OFFER", "REJECTED", "REJECTED_AFTER_INTERVIEW", "WITHDRAWN"],
   OFFER: ["WITHDRAWN"],
   REJECTED: [],
