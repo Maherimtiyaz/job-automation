@@ -5,12 +5,14 @@ import { DEFAULT_MIN_RELEVANCE_SCORE, DEFAULT_MIN_ROLE_SCORE } from "./scoring/r
 export const DEFAULT_DATABASE_PATH = "data/job-automation.db";
 export const DEFAULT_PROFILE_PATH = "data/profile.json";
 export const DEFAULT_COMPANIES_PATH = "data/companies.json";
+export const DEFAULT_RESUME_PATH = "data/resumes.json";
 
 const envSchema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
   DATABASE_PATH: z.string().trim().min(1).default(DEFAULT_DATABASE_PATH),
   PROFILE_PATH: z.string().trim().min(1).default(DEFAULT_PROFILE_PATH),
   COMPANIES_PATH: z.string().trim().min(1).default(DEFAULT_COMPANIES_PATH),
+  RESUME_PATH: z.string().trim().min(1).default(DEFAULT_RESUME_PATH),
   RELEVANCE_MIN_SCORE: z.coerce
     .number()
     .min(0)

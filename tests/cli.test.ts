@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { openDatabase } from "../src/db/connection.js";
 import { runCli } from "../src/cli.js";
+import { ApplicationRepository } from "../src/repositories/applications.js";
 import { CompanyRepository } from "../src/repositories/companies.js";
 import { JobRepository } from "../src/repositories/jobs.js";
 
@@ -45,6 +46,7 @@ function tempEnv(): { dir: string; cleanup(): void } {
   process.env.DATABASE_PATH = join(dir, "test.db");
   process.env.PROFILE_PATH = join(dir, "profile.json");
   process.env.COMPANIES_PATH = join(dir, "companies.json");
+  process.env.RESUME_PATH = join(dir, "resumes.json");
   return {
     dir,
     cleanup: () => {
@@ -394,6 +396,303 @@ test("applications create/list/status/events workflow", async () => {
     captured.clear();
     assert.equal(await runCli(["applications", "create", "1"]), 1);
     assert.ok(captured.errors.join("\n").includes("already exists"));
+  } finally {
+    captured.restore();
+    env.cleanup();
+  }
+});
+
+test("resumes store round-trips through the CLI", async () => {
+  const env = tempEnv();
+  const captured = captureConsole();
+  try {
+    const resumePath = join(env.dir, "Ada_Resume.pdf");
+    writeFileSync(resumePath, "%PDF fake", "utf8");
+    const coverPath = join(env.dir, "Ada_Cover.pdf");
+    writeFileSync(coverPath, "%PDF fake", "utf8");
+
+    assert.equal(await runCli(["resumes:init"]), 0);
+    assert.ok(captured.logs.join("\n").includes("Wrote resume registry template"));
+
+    captured.clear();
+    assert.equal(await runCli(["resumes:add", "--file", resumePath, "--default"]), 0);
+    assert.ok(captured.logs.join("\n").includes('Added resume "Ada_Resume" [ada-resume]'));
+
+    captured.clear();
+    assert.equal(
+      await runCli(["resumes:add", "--file", coverPath, "--kind", "cover_letter", "--default"]),
+      0,
+    );
+    assert.ok(captured.logs.join("\n").includes("Ada_Cover"));
+
+    captured.clear();
+    assert.equal(await runCli(["resumes:list"]), 0);
+    const listLog = captured.logs.join("\n");
+    assert.ok(listLog.includes("[resume] ada-resume"));
+    assert.ok(listLog.includes("[cover_letter] ada-cover"));
+    assert.ok(listLog.includes("*default"));
+
+    captured.clear();
+    assert.equal(await runCli(["resumes:remove", "--id", "ada-cover"]), 0);
+    assert.ok(captured.logs.join("\n").includes("Removed cover_letter"));
+
+    captured.clear();
+    assert.equal(await runCli(["resumes:list"]), 0);
+    const after = captured.logs.join("\n");
+    assert.ok(!after.includes("ada-cover"));
+    assert.ok(after.includes("ada-resume"));
+  } finally {
+    captured.restore();
+    env.cleanup();
+  }
+});
+
+test("resumes:add without a registry explains the next step", async () => {
+  const env = tempEnv();
+  const captured = captureConsole();
+  try {
+    const resumePath = join(env.dir, "plain.pdf");
+    writeFileSync(resumePath, "%PDF fake", "utf8");
+    const code = await runCli(["resumes:add", "--file", resumePath]);
+    assert.equal(code, 1);
+    assert.ok(captured.errors.join("\n").includes("resumes:init"));
+  } finally {
+    captured.restore();
+    env.cleanup();
+  }
+});
+
+test("resumes:add rejects an unsupported file type", async () => {
+  const env = tempEnv();
+  const captured = captureConsole();
+  try {
+    await runCli(["resumes:init"]);
+    const exePath = join(env.dir, "resume.exe");
+    writeFileSync(exePath, "binary", "utf8");
+
+    captured.clear();
+    const code = await runCli(["resumes:add", "--file", exePath]);
+    assert.equal(code, 1);
+    assert.ok(captured.errors.join("\n").includes("unsupported extension"));
+  } finally {
+    captured.restore();
+    env.cleanup();
+  }
+});
+
+test("applications create attaches the store default resume", async () => {
+  const env = tempEnv();
+  const captured = captureConsole();
+  try {
+    const db = openDatabase(process.env.DATABASE_PATH as string);
+    const company = new CompanyRepository(db).create({ name: "Acme" });
+    new JobRepository(db).create({
+      companyId: company.id,
+      title: "Backend Engineer",
+      url: "https://acme.test/jobs/1",
+      source: "greenhouse",
+      externalJobId: "1",
+    });
+    db.close();
+
+    const resumePath = join(env.dir, "Ada_Resume.pdf");
+    writeFileSync(resumePath, "%PDF fake", "utf8");
+    await runCli(["resumes:init"]);
+    await runCli(["resumes:add", "--file", resumePath, "--default"]);
+
+    captured.clear();
+    assert.equal(await runCli(["applications", "create", "1", "--default-resume"]), 0);
+    const created = captured.logs.join("\n");
+    assert.ok(created.includes("Created application 1"));
+    assert.ok(created.includes("[resume ada-resume]"));
+
+    captured.clear();
+    assert.equal(await runCli(["applications", "show", "1"]), 0);
+    assert.ok(captured.logs.join("\n").includes("Resume:   Ada_Resume [ada-resume]"));
+  } finally {
+    captured.restore();
+    env.cleanup();
+  }
+});
+
+test("applications create --default-resume errors without a stored default", async () => {
+  const env = tempEnv();
+  const captured = captureConsole();
+  try {
+    const db = openDatabase(process.env.DATABASE_PATH as string);
+    const company = new CompanyRepository(db).create({ name: "Acme" });
+    new JobRepository(db).create({
+      companyId: company.id,
+      title: "Backend Engineer",
+      url: "https://acme.test/jobs/1",
+      source: "greenhouse",
+      externalJobId: "1",
+    });
+    db.close();
+
+    const code = await runCli(["applications", "create", "1", "--default-resume"]);
+    assert.equal(code, 1);
+    assert.ok(captured.errors.join("\n").includes("no default resume"));
+  } finally {
+    captured.restore();
+    env.cleanup();
+  }
+});
+
+test("browser inspect-url rejects unsupported schemes before launching a browser", async () => {
+  const env = tempEnv();
+  const captured = captureConsole();
+  try {
+    const code = await runCli(["browser", "inspect-url", "javascript:alert(1)"]);
+    assert.equal(code, 1);
+    assert.ok(captured.errors.join("\n").includes("Unsupported URL protocol"));
+  } finally {
+    captured.restore();
+    env.cleanup();
+  }
+});
+
+test("browser inspect-url rejects malformed URLs", async () => {
+  const env = tempEnv();
+  const captured = captureConsole();
+  try {
+    const code = await runCli(["browser", "inspect-url", "not a url"]);
+    assert.equal(code, 1);
+    assert.ok(captured.errors.join("\n").includes("Invalid URL"));
+  } finally {
+    captured.restore();
+    env.cleanup();
+  }
+});
+
+test("browser inspect-url rejects URLs with embedded credentials", async () => {
+  const env = tempEnv();
+  const captured = captureConsole();
+  try {
+    const code = await runCli(["browser", "inspect-url", "https://user:pass@example.com/jobs/1"]);
+    assert.equal(code, 1);
+    assert.ok(captured.errors.join("\n").includes("credentials"));
+  } finally {
+    captured.restore();
+    env.cleanup();
+  }
+});
+
+test("browser inspect-job rejects an unknown job id without launching a browser", async () => {
+  const env = tempEnv();
+  const captured = captureConsole();
+  try {
+    openDatabase(process.env.DATABASE_PATH as string).close();
+    const code = await runCli(["browser", "inspect-job", "999"]);
+    assert.equal(code, 1);
+    assert.ok(captured.errors.join("\n").includes("Job not found"));
+  } finally {
+    captured.restore();
+    env.cleanup();
+  }
+});
+
+test("browser inspect-job rejects a non-numeric job id", async () => {
+  const env = tempEnv();
+  const captured = captureConsole();
+  try {
+    const code = await runCli(["browser", "inspect-job", "abc"]);
+    assert.equal(code, 1);
+    assert.ok(captured.errors.join("\n").includes("positive job id"));
+  } finally {
+    captured.restore();
+    env.cleanup();
+  }
+});
+
+test("analytics reports interaction with applications", async () => {
+  const env = tempEnv();
+  const captured = captureConsole();
+  try {
+    const db = openDatabase(process.env.DATABASE_PATH as string);
+    const company = new CompanyRepository(db).create({
+      name: "Acme",
+      website: "https://acme.test",
+    });
+    const job = new JobRepository(db).create({
+      companyId: company.id,
+      title: "Software Engineer Intern",
+      url: "https://acme.test/jobs/1",
+      source: "greenhouse",
+    });
+    const applications = new ApplicationRepository(db);
+    const app = applications.create({ jobId: job.id });
+    applications.transitionStatus(app.id, "IN_PROGRESS", {});
+    applications.transitionStatus(app.id, "APPROVED", {});
+    applications.transitionStatus(app.id, "SUBMITTED", {});
+    applications.transitionStatus(app.id, "INTERVIEW", {});
+    db.close();
+
+    const code = await runCli(["analytics"]);
+    assert.equal(code, 0);
+    const output = captured.logs.join("\n");
+    assert.ok(output.includes("Application analytics (1 application(s), 1 submitted):"));
+    assert.ok(output.includes("Funnel (current status):"));
+    assert.ok(output.includes("INTERVIEW"));
+    assert.ok(output.includes("response (of submitted): 100.0% (1/1)"));
+    assert.ok(output.includes("Ever reached (from audit history):"));
+    assert.ok(output.includes("submitted: 1"));
+    assert.ok(output.includes("By source (top 5):"));
+    assert.ok(output.includes("greenhouse"));
+  } finally {
+    captured.restore();
+    env.cleanup();
+  }
+});
+
+test("analytics filters by --source", async () => {
+  const env = tempEnv();
+  const captured = captureConsole();
+  try {
+    const db = openDatabase(process.env.DATABASE_PATH as string);
+    const company = new CompanyRepository(db).create({
+      name: "Acme",
+      website: "https://acme.test",
+    });
+    const greenhouseJob = new JobRepository(db).create({
+      companyId: company.id,
+      title: "Intern A",
+      url: "https://acme.test/jobs/a",
+      source: "greenhouse",
+    });
+    const leverJob = new JobRepository(db).create({
+      companyId: company.id,
+      title: "Intern B",
+      url: "https://acme.test/jobs/b",
+      source: "lever",
+    });
+    const applications = new ApplicationRepository(db);
+    applications.create({ jobId: greenhouseJob.id });
+    applications.transitionStatus(applications.create({ jobId: leverJob.id }).id, "IN_PROGRESS", {});
+    db.close();
+
+    const code = await runCli(["analytics", "--source", "greenhouse"]);
+    assert.equal(code, 0);
+    const output = captured.logs.join("\n");
+    assert.ok(output.includes("Application analytics (1 application(s)):"));
+    assert.ok(output.includes("DRAFT"));
+    assert.ok(!output.includes("lever"));
+  } finally {
+    captured.restore();
+    env.cleanup();
+  }
+});
+
+test("analytics on an empty database reports zero applications", async () => {
+  const env = tempEnv();
+  const captured = captureConsole();
+  try {
+    const code = await runCli(["analytics"]);
+    assert.equal(code, 0);
+    const output = captured.logs.join("\n");
+    assert.ok(output.includes("Application analytics (0 application(s)):"));
+    assert.ok(output.includes("median: -"));
+    assert.ok(output.includes("none"));
   } finally {
     captured.restore();
     env.cleanup();

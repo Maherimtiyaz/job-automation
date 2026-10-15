@@ -11,4 +11,5 @@ profile.json
 playwright-report/
 test-results/
 screenshots/
+reports/
 logs/

@@ -21,6 +21,8 @@ test("createEmptyProfile ships the known target roles with default priority", ()
   const profile = createEmptyProfile();
 
   assert.equal(profile.fullName, null);
+  assert.equal(profile.email, null);
+  assert.equal(profile.phone, null);
   assert.equal(profile.location, null);
   assert.equal(profile.minimumSalary, null);
   assert.equal(profile.skills.length, 0);
@@ -37,7 +39,12 @@ test("CandidateProfileSchema parses a fully populated profile", () => {
   const profile = CandidateProfileSchema.parse({
     fullName: "Ada Lovelace",
     headline: "Backend Engineer Intern",
+    email: "ada@example.com",
+    phone: "+44 20 7946 0958",
     location: "London, UK",
+    linkedinUrl: "https://linkedin.com/in/ada",
+    githubUrl: "https://github.com/ada",
+    websiteUrl: "https://ada.example",
     targetRoles: [{ role: "Backend Engineer", priority: 5 }],
     skills: [{ name: "SQL", proficiency: "advanced", years: 2 }],
     workExperience: [
@@ -49,9 +56,15 @@ test("CandidateProfileSchema parses a fully populated profile", () => {
   });
 
   assert.equal(profile.fullName, "Ada Lovelace");
+  assert.equal(profile.email, "ada@example.com");
+  assert.equal(profile.githubUrl, "https://github.com/ada");
   assert.equal(profile.skills[0]?.proficiency, "advanced");
   assert.equal(profile.minimumSalary?.currency, "USD");
   assert.equal(profile.minimumSalary?.period, "YEAR");
+});
+
+test("CandidateProfileSchema rejects an invalid email", () => {
+  assert.equal(CandidateProfileSchema.safeParse({ email: "not-an-email" }).success, false);
 });
 
 test("CandidateProfileSchema rejects invalid values", () => {
@@ -73,6 +86,8 @@ test("describeProfileGaps reports every missing signal on an empty profile", () 
   const fields = gaps.map((gap) => gap.field);
 
   assert.ok(fields.includes("fullName"));
+  assert.ok(fields.includes("email"));
+  assert.ok(fields.includes("phone"));
   assert.ok(fields.includes("location"));
   assert.ok(fields.includes("skills"));
   assert.ok(fields.includes("workExperience"));

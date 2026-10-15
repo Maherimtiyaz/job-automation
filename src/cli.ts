@@ -1,5 +1,10 @@
 import type { AppConfig } from "./config.js";
 import { ConfigError, loadConfig } from "./config.js";
+import { BrowserService } from "./browser/browserService.js";
+import { buildFillPlan } from "./browser/fillPlan.js";
+import { printFillPlan, printInspectionReport, writeInspectionReport } from "./browser/report.js";
+import type { InspectOperationOptions } from "./browser/types.js";
+import { validateInspectUrl } from "./browser/urlPolicy.js";
 import type { Db } from "./db/connection.js";
 import { openDatabase } from "./db/connection.js";
 import { getDatabaseStats } from "./db/diagnostics.js";
@@ -7,8 +12,19 @@ import { DomainError } from "./domain/errors.js";
 import type { Job } from "./domain/job.js";
 import { RECOMMENDATIONS } from "./domain/job.js";
 import { normalizeCompanyName } from "./domain/normalize.js";
+import { computeApplicationAnalytics } from "./domain/analytics.js";
+import type { ApplicationAnalyticsReport, GroupBreakdown, RateMetric } from "./domain/analytics.js";
 import { describeProfileGaps } from "./domain/profile.js";
 import type { CandidateProfile } from "./domain/profile.js";
+import type { ResumeRegistry } from "./domain/resume.js";
+import {
+  defaultResumeForKind,
+  findResume,
+  RESUME_KINDS,
+  ResumeKindSchema,
+  type ResumeDocument,
+  type ResumeKind,
+} from "./domain/resume.js";
 import { REVIEW_STATUSES, ReviewStatusSchema, type ReviewStatus } from "./domain/review.js";
 import { APPLICATION_STATUSES, ApplicationStatusSchema } from "./domain/status.js";
 import { ingestJobs } from "./ingest/ingest.js";
@@ -30,6 +46,16 @@ import {
   type AtsPlatform,
 } from "./registry/companyStore.js";
 import { ApplicationRepository } from "./repositories/applications.js";
+import { AnalyticsRepository } from "./repositories/analytics.js";
+import {
+  addResumeToRegistry,
+  listResumes,
+  removeResumeFromRegistry,
+  ResumeRegistryNotFoundError,
+  setDefaultResume,
+  tryLoadResumeRegistry,
+  writeResumeRegistryTemplate,
+} from "./resume/resumeStore.js";
 import { CompanyRepository } from "./repositories/companies.js";
 import { JobRepository } from "./repositories/jobs.js";
 import { JobReviewRepository } from "./repositories/jobReviews.js";
@@ -56,6 +82,15 @@ Commands:
                       Register a company for job discovery
   companies:enable --name "Acme"
   companies:disable --name "Acme"
+  resumes:init [--force]
+                      Write a starter resume registry template to RESUME_PATH
+  resumes:list        List resumes/cover letters in the local store
+  resumes:add --file PATH [--label TEXT] [--kind resume|cover_letter] [--id ID]
+                      [--default] [--notes TEXT]
+                      Register a local resume/cover-letter file
+  resumes:remove --id ID
+  resumes:default --id ID
+                      Set the default resume/cover letter for its kind
   jobs sources        List supported job sources and enabled company counts
   jobs discover [--source greenhouse|lever] [--limit N] [--dry-run] [--company NAME]
                       Fetch and ingest job listings from registered companies
@@ -71,21 +106,49 @@ Commands:
   jobs reopen <id>    Return a reviewed job to NEW
   jobs review-history <id>
                       Show the review/event history for a job
-  applications create <jobId> [--resume VERSION] [--notes TEXT]
+  applications create <jobId> [--resume VERSION] [--default-resume] [--notes TEXT]
+                      [--default-resume] attaches the store's default resume
+  resumes:init [--force]
+                      Write a starter resume registry template to RESUME_PATH
+  resumes:list        List resumes/cover letters in the local store
+  resumes:add --file PATH [--label TEXT] [--kind resume|cover_letter] [--id ID]
+                      [--default] [--notes TEXT]
+                      Register a local resume/cover-letter file
+  resumes:remove --id ID
+  resumes:default --id ID
+                      Set the default resume/cover letter for its kind
   applications list [--status S] [--limit N]
   applications show <id>
   applications status <id> <STATUS> [--message TEXT]
   applications events <id>
+  analytics [--source S] [--company NAME]
+                      Show application analytics: funnel, response/offer rates,
+                      and per-source / per-company breakdowns
+  browser inspect-job <jobId> [--headed] [--screenshot [PATH]] [--output PATH]
+                      [--timeout MS] [--fill-plan] [--show-values]
+                      Open a job's URL in a read-only browser and report what is on it
+  browser inspect-url <url> [--headed] [--screenshot [PATH]] [--output PATH]
+                      [--timeout MS] [--fill-plan] [--show-values]
+                      Inspect an arbitrary URL with a read-only browser; nothing is filled or submitted
   help                Show this help
 
 Options:
   --dry-run           Report what would be ingested without writing anything
   --force             Overwrite existing template files
+  --headed            Show the browser window instead of running headless
+  --screenshot        Save a screenshot (default: screenshots/inspect-<timestamp>.png)
+  --output PATH       Write the inspection report as JSON to PATH
+  --timeout MS        Navigation timeout in milliseconds (default: 15000)
+  --fill-plan         Map detected form fields to profile data (read-only; never fills)
+  --show-values       Include profile values in the fill plan (redacted by default)
+  --resume ID         Attach a resume from the store by id (applications create)
+  --default-resume    Attach the store's default resume (applications create)
 
 Environment:
   DATABASE_PATH       SQLite database path (default: data/job-automation.db)
   PROFILE_PATH        Candidate profile JSON path (default: data/profile.json)
   COMPANIES_PATH      Company registry JSON path (default: data/companies.json)
+  RESUME_PATH         Resume/cover-letter registry JSON path (default: data/resumes.json)
   RELEVANCE_MIN_SCORE Min total score for a RELEVANT verdict (default: 55)
   RELEVANCE_MIN_ROLE_SCORE
                       Min role score for a RELEVANT verdict (default: 25)`;
@@ -171,10 +234,24 @@ export async function runCli(argv: readonly string[]): Promise<number> {
         return await runCompaniesSetActive(rest, true);
       case "companies:disable":
         return await runCompaniesSetActive(rest, false);
+      case "resumes:init":
+        return await runResumesInit(rest);
+      case "resumes:list":
+        return await runResumesList();
+      case "resumes:add":
+        return await runResumesAdd(rest);
+      case "resumes:remove":
+        return await runResumesRemove(rest);
+      case "resumes:default":
+        return await runResumesDefault(rest);
       case "jobs":
         return await runJobs(rest);
       case "applications":
         return await runApplications(rest);
+      case "analytics":
+        return await runAnalytics(rest);
+      case "browser":
+        return await runBrowser(rest);
       case "help":
       case "--help":
       case "-h":
@@ -444,12 +521,150 @@ async function runCompaniesSetActive(argv: readonly string[], active: boolean): 
   }
 }
 
+const RESUME_INIT_HINT =
+  'Run "resumes:init" to create one, then "resumes:add --file <path>" to register files.';
+
+async function runResumesInit(argv: readonly string[]): Promise<number> {
+  const force = argv.includes("--force");
+  const config = loadConfig();
+  const path = writeResumeRegistryTemplate(config.RESUME_PATH, { overwrite: force });
+  console.log(`Wrote resume registry template to ${path}.`);
+  return 0;
+}
+
+async function runResumesList(): Promise<number> {
+  const config = loadConfig();
+
+  let resumes: ResumeDocument[];
+  try {
+    resumes = listResumes(config.RESUME_PATH);
+  } catch (error) {
+    if (error instanceof ResumeRegistryNotFoundError) {
+      console.error(`Error: ${error.message}`);
+      console.error(RESUME_INIT_HINT);
+      return 1;
+    }
+    throw error;
+  }
+
+  if (resumes.length === 0) {
+    console.log(`No resumes or cover letters in the store (${config.RESUME_PATH}).`);
+    return 0;
+  }
+
+  console.log(`Resume store: ${config.RESUME_PATH}`);
+  for (const resume of resumes) {
+    const marker = resume.isDefault ? " *default" : "";
+    const notes = resume.notes ? ` (${resume.notes})` : "";
+    console.log(`  [${resume.kind}] ${resume.id} "${resume.label}" -> ${resume.filePath}${marker}${notes}`);
+  }
+  return 0;
+}
+
+async function runResumesAdd(argv: readonly string[]): Promise<number> {
+  const config = loadConfig();
+  const parsed = parseArgs(argv);
+
+  const filePath = readFlag(parsed, "file");
+  if (!filePath) {
+    console.error("Error: --file is required (path to a resume or cover-letter file).");
+    return 1;
+  }
+
+  const kindRaw = readFlag(parsed, "kind") ?? "resume";
+  if (!ResumeKindSchema.safeParse(kindRaw).success) {
+    console.error(`Error: --kind must be one of: ${RESUME_KINDS.join(", ")}.`);
+    return 1;
+  }
+
+  const label = readFlag(parsed, "label");
+  const id = readFlag(parsed, "id");
+  const notes = readFlag(parsed, "notes");
+  const makeDefault = parsed.flags["default"] === true;
+
+  let document: ResumeDocument;
+  try {
+    document = addResumeToRegistry(config.RESUME_PATH, {
+      filePath,
+      kind: kindRaw as ResumeKind,
+      isDefault: makeDefault,
+      ...(label !== undefined ? { label } : {}),
+      ...(id !== undefined ? { id } : {}),
+      ...(notes !== undefined ? { notes } : {}),
+    });
+  } catch (error) {
+    if (error instanceof ResumeRegistryNotFoundError) {
+      console.error(`Error: ${error.message}`);
+      console.error(RESUME_INIT_HINT);
+      return 1;
+    }
+    throw error;
+  }
+
+  const suffix = document.isDefault ? " (default)" : "";
+  console.log(
+    `Added ${document.kind} "${document.label}" [${document.id}] to ${config.RESUME_PATH}${suffix}.`,
+  );
+  return 0;
+}
+
+async function runResumesRemove(argv: readonly string[]): Promise<number> {
+  const config = loadConfig();
+  const parsed = parseArgs(argv);
+  const id = readFlag(parsed, "id") ?? parsed.positionals[0];
+  if (!id) {
+    console.error("Error: --id is required (resume id).");
+    return 1;
+  }
+
+  try {
+    const removed = removeResumeFromRegistry(config.RESUME_PATH, id);
+    console.log(
+      `Removed ${removed.kind} "${removed.label}" [${removed.id}] from ${config.RESUME_PATH}.`,
+    );
+    return 0;
+  } catch (error) {
+    if (error instanceof ResumeRegistryNotFoundError) {
+      console.error(`Error: ${error.message}`);
+      console.error(RESUME_INIT_HINT);
+      return 1;
+    }
+    throw error;
+  }
+}
+
+async function runResumesDefault(argv: readonly string[]): Promise<number> {
+  const config = loadConfig();
+  const parsed = parseArgs(argv);
+  const id = readFlag(parsed, "id") ?? parsed.positionals[0];
+  if (!id) {
+    console.error("Error: --id is required (resume id).");
+    return 1;
+  }
+
+  try {
+    const document = setDefaultResume(config.RESUME_PATH, id);
+    console.log(
+      `Default ${document.kind} is now "${document.label}" [${document.id}].`,
+    );
+    return 0;
+  } catch (error) {
+    if (error instanceof ResumeRegistryNotFoundError) {
+      console.error(`Error: ${error.message}`);
+      console.error(RESUME_INIT_HINT);
+      return 1;
+    }
+    throw error;
+  }
+}
+
 async function runJobs(argv: readonly string[]): Promise<number> {
   const [subcommand = "", ...rest] = argv;
 
   switch (subcommand) {
     case "sources":
       return await runJobsSources();
+    case "discover":
     case "discover":
       return await runJobsDiscover(rest);
     case "list":
@@ -978,13 +1193,30 @@ async function runApplicationCreate(argv: readonly string[]): Promise<number> {
     return 1;
   }
 
-  const resumeVersion = readFlag(parsed, "resume");
+  let resumeVersion = readFlag(parsed, "resume");
+  const useDefaultResume = parsed.flags["default-resume"] === true;
+  if (resumeVersion !== undefined && useDefaultResume) {
+    console.error("Error: use either --resume ID or --default-resume, not both.");
+    return 1;
+  }
   const notes = readFlag(parsed, "notes");
 
-  return withDatabase((db) => {
+  return withDatabase((db, config) => {
     const jobs = new JobRepository(db);
     const applications = new ApplicationRepository(db);
     const companies = new CompanyRepository(db);
+
+    if (useDefaultResume) {
+      const registry = tryLoadResumeRegistry(config.RESUME_PATH);
+      const document = registry ? defaultResumeForKind(registry, "resume") : null;
+      if (document === null) {
+        console.error(
+          'Error: no default resume in the store. Add one with "resumes:add --file <path> --default".',
+        );
+        return 1;
+      }
+      resumeVersion = document.id;
+    }
 
     const job = jobs.getById(jobId);
     const application = applications.create({
@@ -993,9 +1225,10 @@ async function runApplicationCreate(argv: readonly string[]): Promise<number> {
       ...(notes !== undefined ? { notes } : {}),
     });
     const company = companies.findById(job.companyId);
+    const resumeSuffix = application.resumeVersion ? ` [resume ${application.resumeVersion}]` : "";
     console.log(
       `Created application ${application.id} for job ${jobId} "${job.title}" ` +
-        `(${company?.name ?? String(job.companyId)}) [status ${application.status}].`,
+        `(${company?.name ?? String(job.companyId)}) [status ${application.status}]${resumeSuffix}.`,
     );
     return 0;
   });
@@ -1048,6 +1281,7 @@ function printApplication(
   jobs: JobRepository,
   companies: CompanyRepository,
   app: import("./domain/application.js").Application,
+  resumeLabel: string,
 ): void {
   const job = jobs.findById(app.jobId);
   const company = job !== null ? companies.findById(job.companyId) : undefined;
@@ -1056,7 +1290,7 @@ function printApplication(
   console.log(`  Status:   ${app.status}`);
   console.log(`  Created:  ${app.createdAt}`);
   console.log(`  Updated:  ${app.lastUpdatedAt}`);
-  console.log(`  Resume:   ${app.resumeVersion ?? "-"}`);
+  console.log(`  Resume:   ${resumeLabel}`);
   console.log(`  Notes:    ${app.notes ?? "-"}`);
 }
 
@@ -1068,14 +1302,23 @@ async function runApplicationShow(argv: readonly string[]): Promise<number> {
     return 1;
   }
 
-  return withDatabase((db) => {
+  return withDatabase((db, config) => {
     const applications = new ApplicationRepository(db);
     const jobs = new JobRepository(db);
     const companies = new CompanyRepository(db);
     const app = applications.getById(id);
-    printApplication(jobs, companies, app);
+    const registry = tryLoadResumeRegistry(config.RESUME_PATH);
+    printApplication(jobs, companies, app, describeResumeVersion(registry, app.resumeVersion));
     return 0;
   });
+}
+
+function describeResumeVersion(registry: ResumeRegistry | null, version: string | null): string {
+  if (version === null) {
+    return "-";
+  }
+  const document = registry ? findResume(registry, version) : null;
+  return document ? `${document.label} [${document.id}]` : version;
 }
 
 async function runApplicationStatus(argv: readonly string[]): Promise<number> {
@@ -1126,4 +1369,214 @@ async function runApplicationEvents(argv: readonly string[]): Promise<number> {
     }
     return 0;
   });
+}
+
+async function runAnalytics(argv: readonly string[]): Promise<number> {
+  const parsed = parseArgs(argv);
+  const sourceFilter = readFlag(parsed, "source");
+  const companyFilter = readFlag(parsed, "company");
+
+  return withDatabase((db) => {
+    const rows = new AnalyticsRepository(db).applicationRows();
+    const filtered = rows.filter(
+      (row) =>
+        (sourceFilter === undefined || row.source === sourceFilter) &&
+        (companyFilter === undefined || row.companyName === companyFilter),
+    );
+    printApplicationAnalytics(computeApplicationAnalytics(filtered));
+    return 0;
+  });
+}
+
+function formatRate(metric: RateMetric): string {
+  const percentage = metric.percentage === undefined ? "-" : `${metric.percentage.toFixed(1)}%`;
+  return `${percentage} (${metric.numerator}/${metric.denominator})`;
+}
+
+function formatHours(hours: number | null): string {
+  if (hours === null) {
+    return "-";
+  }
+  if (hours < 1) {
+    return `${Math.round(hours * 60)}m`;
+  }
+  return `${hours.toFixed(1)}h`;
+}
+
+function printGroupBreakdowns(title: string, groups: GroupBreakdown[]): void {
+  console.log(`\n${title} (top 5):`);
+  const top = groups.slice(0, 5);
+  if (top.length === 0) {
+    console.log("  none");
+    return;
+  }
+  for (const group of top) {
+    const responseRate =
+      group.submitted > 0 ? `${((group.responded / group.submitted) * 100).toFixed(1)}%` : "-";
+    console.log(
+      `  ${group.key}: ${group.applications} application(s), ` +
+        `${group.submitted} submitted, ${group.responded} responded (${responseRate}), ` +
+        `${group.offers} offer(s)`,
+    );
+  }
+}
+
+function printApplicationAnalytics(report: ApplicationAnalyticsReport): void {
+  console.log(
+    `Application analytics (${report.applications} application(s)` +
+      `${report.everSubmitted > 0 ? `, ${report.everSubmitted} submitted` : ""}):\n`,
+  );
+
+  console.log("Funnel (current status):");
+  const funnelRows = APPLICATION_STATUSES.filter((status) => (report.funnel[status] ?? 0) > 0);
+  for (const status of funnelRows) {
+    console.log(`  ${status.padEnd(24)}: ${report.funnel[status] ?? 0}`);
+  }
+
+  const { submission, response, interview, offer } = report.rates;
+  console.log("\nRates:");
+  console.log(`  submission (of all):    ${formatRate(submission)}`);
+  console.log(`  response (of submitted): ${formatRate(response)}`);
+  console.log(`  interview (of submitted): ${formatRate(interview)}`);
+  console.log(`  offer (of submitted):   ${formatRate(offer)}`);
+
+  console.log("\nEver reached (from audit history):");
+  console.log(
+    `  submitted: ${report.everSubmitted}  interview: ${report.everInterviewed}  ` +
+      `offer: ${report.everOffered}  rejected: ${report.everRejected}`,
+  );
+
+  const outcomes = report.outcomes;
+  console.log("\nOutcomes (current status):");
+  console.log(
+    `  pre-submission: ${outcomes.preSubmission}  pending-response: ${outcomes.pendingResponse}  ` +
+      `responded: ${outcomes.responded}  closed: ${outcomes.closed}`,
+  );
+  console.log(
+    `  offered: ${outcomes.offered}  rejected: ${outcomes.rejected}  ` +
+      `withdrawn: ${outcomes.withdrawn}  failed: ${outcomes.failed}`,
+  );
+
+  const time = report.timeToSubmit;
+  console.log("\nTime to submit:");
+  console.log(
+    `  median: ${formatHours(time.medianHours)}  average: ${formatHours(time.averageHours)}  ` +
+      `(over ${time.count} submitted application(s) with timestamps)`,
+  );
+
+  printGroupBreakdowns("By source", report.bySource);
+  printGroupBreakdowns("By company", report.byCompany);
+}
+
+async function runBrowser(argv: readonly string[]): Promise<number> {
+  const [subcommand = "", ...rest] = argv;
+
+  switch (subcommand) {
+    case "inspect-job":
+      return await runBrowserInspectJob(rest);
+    case "inspect-url":
+      return await runBrowserInspectUrl(rest);
+    default:
+      if (subcommand === "") {
+        console.error("Error: missing browser subcommand (inspect-job | inspect-url).");
+        return 1;
+      }
+      console.error(`Unknown browser subcommand: ${subcommand}`);
+      return 1;
+  }
+}
+
+async function runBrowserInspectJob(argv: readonly string[]): Promise<number> {
+  const parsed = parseArgs(argv);
+  const id = Number(parsed.positionals[0]);
+  if (!Number.isSafeInteger(id) || id <= 0) {
+    console.error("Error: browser inspect-job requires a positive job id (e.g. browser inspect-job 4).");
+    return 1;
+  }
+
+  const url = await withDatabase((db) => new JobRepository(db).getById(id).canonicalUrl);
+  return runBrowserInspection(url, parsed, `job ${id}`);
+}
+
+async function runBrowserInspectUrl(argv: readonly string[]): Promise<number> {
+  const parsed = parseArgs(argv);
+  const rawUrl = parsed.positionals[0];
+  if (rawUrl === undefined) {
+    console.error(
+      "Error: browser inspect-url requires a URL (e.g. browser inspect-url https://boards.greenhouse.io/acme/jobs/123).",
+    );
+    return 1;
+  }
+
+  const url = validateInspectUrl(rawUrl).href;
+  return runBrowserInspection(url, parsed, "inspect-url");
+}
+
+function loadProfileForFillPlan(): CandidateProfile | null {
+  const config = loadConfig();
+  if (!profileExists(config.PROFILE_PATH)) {
+    return null;
+  }
+  return loadProfileFromFile(config.PROFILE_PATH);
+}
+
+function loadResumeRegistryForFillPlan(): ResumeRegistry | null {
+  const config = loadConfig();
+  return tryLoadResumeRegistry(config.RESUME_PATH);
+}
+
+async function runBrowserInspection(
+  url: string,
+  parsed: ParsedArgs,
+  label: string,
+): Promise<number> {
+  const headed = parsed.flags["headed"] === true;
+  const screenshot = parsed.flags["screenshot"];
+  const output = readFlag(parsed, "output");
+  const timeout = readIntFlag(parsed, "timeout", 0);
+  const wantsFillPlan = parsed.flags["fill-plan"] === true;
+  const showValues = parsed.flags["show-values"] === true;
+
+  const service = new BrowserService({
+    headless: !headed,
+    ...(timeout !== undefined ? { navigationTimeoutMs: timeout } : {}),
+  });
+
+  const options: InspectOperationOptions = {};
+  if (screenshot !== undefined) {
+    options.screenshot = screenshot === true ? true : screenshot;
+  }
+  if (timeout !== undefined) {
+    options.navigationTimeoutMs = timeout;
+  }
+
+  try {
+    const report = await service.inspect(url, options);
+    if (wantsFillPlan) {
+      report.fillPlan = buildFillPlan({
+        forms: report.forms,
+        profile: loadProfileForFillPlan(),
+        resumes: loadResumeRegistryForFillPlan(),
+        pageKind: report.pageKind,
+        hasApplicationForm: report.hasApplicationForm,
+        includeValues: showValues,
+      });
+    }
+    if (output !== undefined) {
+      writeInspectionReport(output, report);
+    }
+    if (label !== "inspect-url") {
+      console.log(`Inspecting ${label}: ${url}`);
+    }
+    printInspectionReport(report);
+    if (report.fillPlan !== null && report.fillPlan !== undefined) {
+      printFillPlan(report.fillPlan);
+    }
+    if (output !== undefined) {
+      console.log(`Wrote inspection report to ${output}.`);
+    }
+    return 0;
+  } finally {
+    await service.close();
+  }
 }
