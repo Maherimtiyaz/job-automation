@@ -1,5 +1,9 @@
 import type { AppConfig } from "./config.js";
 import { ConfigError, loadConfig } from "./config.js";
+import { BrowserService } from "./browser/browserService.js";
+import { printInspectionReport, writeInspectionReport } from "./browser/report.js";
+import type { InspectOperationOptions } from "./browser/types.js";
+import { validateInspectUrl } from "./browser/urlPolicy.js";
 import type { Db } from "./db/connection.js";
 import { openDatabase } from "./db/connection.js";
 import { getDatabaseStats } from "./db/diagnostics.js";
@@ -76,11 +80,21 @@ Commands:
   applications show <id>
   applications status <id> <STATUS> [--message TEXT]
   applications events <id>
+  browser inspect-job <jobId> [--headed] [--screenshot [PATH]] [--output PATH]
+                      [--timeout MS]
+                      Open a job's URL in a read-only browser and report what is on it
+  browser inspect-url <url> [--headed] [--screenshot [PATH]] [--output PATH]
+                      [--timeout MS]
+                      Inspect an arbitrary URL with a read-only browser; nothing is filled or submitted
   help                Show this help
 
 Options:
   --dry-run           Report what would be ingested without writing anything
   --force             Overwrite existing template files
+  --headed            Show the browser window instead of running headless
+  --screenshot        Save a screenshot (default: screenshots/inspect-<timestamp>.png)
+  --output PATH       Write the inspection report as JSON to PATH
+  --timeout MS        Navigation timeout in milliseconds (default: 15000)
 
 Environment:
   DATABASE_PATH       SQLite database path (default: data/job-automation.db)
@@ -175,6 +189,8 @@ export async function runCli(argv: readonly string[]): Promise<number> {
         return await runJobs(rest);
       case "applications":
         return await runApplications(rest);
+      case "browser":
+        return await runBrowser(rest);
       case "help":
       case "--help":
       case "-h":
@@ -1126,4 +1142,89 @@ async function runApplicationEvents(argv: readonly string[]): Promise<number> {
     }
     return 0;
   });
+}
+
+async function runBrowser(argv: readonly string[]): Promise<number> {
+  const [subcommand = "", ...rest] = argv;
+
+  switch (subcommand) {
+    case "inspect-job":
+      return await runBrowserInspectJob(rest);
+    case "inspect-url":
+      return await runBrowserInspectUrl(rest);
+    default:
+      if (subcommand === "") {
+        console.error("Error: missing browser subcommand (inspect-job | inspect-url).");
+        return 1;
+      }
+      console.error(`Unknown browser subcommand: ${subcommand}`);
+      return 1;
+  }
+}
+
+async function runBrowserInspectJob(argv: readonly string[]): Promise<number> {
+  const parsed = parseArgs(argv);
+  const id = Number(parsed.positionals[0]);
+  if (!Number.isSafeInteger(id) || id <= 0) {
+    console.error("Error: browser inspect-job requires a positive job id (e.g. browser inspect-job 4).");
+    return 1;
+  }
+
+  const url = await withDatabase((db) => new JobRepository(db).getById(id).canonicalUrl);
+  return runBrowserInspection(url, parsed, `job ${id}`);
+}
+
+async function runBrowserInspectUrl(argv: readonly string[]): Promise<number> {
+  const parsed = parseArgs(argv);
+  const rawUrl = parsed.positionals[0];
+  if (rawUrl === undefined) {
+    console.error(
+      "Error: browser inspect-url requires a URL (e.g. browser inspect-url https://boards.greenhouse.io/acme/jobs/123).",
+    );
+    return 1;
+  }
+
+  const url = validateInspectUrl(rawUrl).href;
+  return runBrowserInspection(url, parsed, "inspect-url");
+}
+
+async function runBrowserInspection(
+  url: string,
+  parsed: ParsedArgs,
+  label: string,
+): Promise<number> {
+  const headed = parsed.flags["headed"] === true;
+  const screenshot = parsed.flags["screenshot"];
+  const output = readFlag(parsed, "output");
+  const timeout = readIntFlag(parsed, "timeout", 0);
+
+  const service = new BrowserService({
+    headless: !headed,
+    ...(timeout !== undefined ? { navigationTimeoutMs: timeout } : {}),
+  });
+
+  const options: InspectOperationOptions = {};
+  if (screenshot !== undefined) {
+    options.screenshot = screenshot === true ? true : screenshot;
+  }
+  if (timeout !== undefined) {
+    options.navigationTimeoutMs = timeout;
+  }
+
+  try {
+    const report = await service.inspect(url, options);
+    if (output !== undefined) {
+      writeInspectionReport(output, report);
+    }
+    if (label !== "inspect-url") {
+      console.log(`Inspecting ${label}: ${url}`);
+    }
+    printInspectionReport(report);
+    if (output !== undefined) {
+      console.log(`Wrote inspection report to ${output}.`);
+    }
+    return 0;
+  } finally {
+    await service.close();
+  }
 }

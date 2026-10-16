@@ -399,3 +399,69 @@ test("applications create/list/status/events workflow", async () => {
     env.cleanup();
   }
 });
+
+test("browser inspect-url rejects unsupported schemes before launching a browser", async () => {
+  const env = tempEnv();
+  const captured = captureConsole();
+  try {
+    const code = await runCli(["browser", "inspect-url", "javascript:alert(1)"]);
+    assert.equal(code, 1);
+    assert.ok(captured.errors.join("\n").includes("Unsupported URL protocol"));
+  } finally {
+    captured.restore();
+    env.cleanup();
+  }
+});
+
+test("browser inspect-url rejects malformed URLs", async () => {
+  const env = tempEnv();
+  const captured = captureConsole();
+  try {
+    const code = await runCli(["browser", "inspect-url", "not a url"]);
+    assert.equal(code, 1);
+    assert.ok(captured.errors.join("\n").includes("Invalid URL"));
+  } finally {
+    captured.restore();
+    env.cleanup();
+  }
+});
+
+test("browser inspect-url rejects URLs with embedded credentials", async () => {
+  const env = tempEnv();
+  const captured = captureConsole();
+  try {
+    const code = await runCli(["browser", "inspect-url", "https://user:pass@example.com/jobs/1"]);
+    assert.equal(code, 1);
+    assert.ok(captured.errors.join("\n").includes("credentials"));
+  } finally {
+    captured.restore();
+    env.cleanup();
+  }
+});
+
+test("browser inspect-job rejects an unknown job id without launching a browser", async () => {
+  const env = tempEnv();
+  const captured = captureConsole();
+  try {
+    openDatabase(process.env.DATABASE_PATH as string).close();
+    const code = await runCli(["browser", "inspect-job", "999"]);
+    assert.equal(code, 1);
+    assert.ok(captured.errors.join("\n").includes("Job not found"));
+  } finally {
+    captured.restore();
+    env.cleanup();
+  }
+});
+
+test("browser inspect-job rejects a non-numeric job id", async () => {
+  const env = tempEnv();
+  const captured = captureConsole();
+  try {
+    const code = await runCli(["browser", "inspect-job", "abc"]);
+    assert.equal(code, 1);
+    assert.ok(captured.errors.join("\n").includes("positive job id"));
+  } finally {
+    captured.restore();
+    env.cleanup();
+  }
+});

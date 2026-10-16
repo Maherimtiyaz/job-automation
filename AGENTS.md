@@ -33,6 +33,10 @@ The compiled entry point is also the CLI:
 - `node dist/index.js applications list [--status S] [--limit N]`
 - `node dist/index.js applications show <id>` / `applications status <id> <STATUS> [--message TEXT]`
 - `node dist/index.js applications events <id>`
+- `node dist/index.js browser inspect-job <jobId> [--headed] [--screenshot [PATH]] [--output PATH] [--timeout MS]`
+  — open a job's URL in a read-only browser and report what is on it
+- `node dist/index.js browser inspect-url <url> [--headed] [--screenshot [PATH]] [--output PATH] [--timeout MS]`
+  — inspect an arbitrary URL with a read-only browser; nothing is filled or submitted
 
 ## Architecture
 
@@ -57,6 +61,12 @@ Layers, from outside in:
   upsert, rescore when needed, and produce a summary.
 - `src/repositories/` — data access. Accept `unknown` at the boundary, validate with
   the domain schemas, and translate SQLite errors into domain errors.
+- `src/browser/` — Playwright-based, strictly read-only page inspection. `urlPolicy.ts`
+  (URL validation + network classification, pure), `ats.ts` (ATS detection, pure),
+  `inspector.ts` (DOM extraction + page classification), `browserService.ts`
+  (`BrowserService` launch/lifecycle/timeouts/screenshots), `report.ts` (printing +
+  sanitized JSON). DOM extraction runs inside the page and must remain self-contained
+  (it is serialized by Playwright).
 - `src/index.ts` — entry point; delegates to `runCli`. Diagnostic only.
 
 Rules:
@@ -284,6 +294,40 @@ listing, upsert, and score. It never creates applications.
 
 Summary invariants (report these in CLI output): `valid = inserted + updated + duplicates`
 and `listingsFetched = valid + invalid`.
+
+## Browser inspection
+
+`browser inspect-job <id>` and `browser inspect-url <url>` launch a Playwright Chromium and
+inspect a page **read-only**. They never fill fields, never click or submit forms, never
+handle authentication, and never touch `applications`/`review_events`.
+
+- URL policy (`src/browser/urlPolicy.ts`): only `http:`/`https:` URLs are accepted. Also
+  rejected: malformed URLs, `javascript:`/`data:`/`file:`/`ftp:` schemes, and URLs with
+  embedded credentials. Navigation to the final (possibly redirected) URL is re-validated;
+  a redirect to a non-HTTP target is an `unsupported_protocol` problem.
+- Network classification: `localhost` (loopback + `*.localhost`), `private` (RFC1918 IPv4,
+  `fc00::/7`), `link_local` (`169.254/16`, `fe80::/10`, `*.local`), else `public`. Any
+  non-public target produces a "only inspect pages you trust" warning; a public-to-private
+  redirect is flagged as a possible DNS-rebinding.
+- Privacy: field *values* are never read or logged. Password inputs, and inputs whose
+  `autocomplete` is `current-password`/`new-password`/`one-time-code`/`cc-*`, are marked
+  `sensitive: true` and still described structurally (name, label, required) without any
+  data. Hidden inputs are counted (`hiddenFieldCount`) but not listed. Reports and
+  screenshots never contain cookies, tokens, headers, or full-page HTML.
+- Inspected fields: visible headings, links (with an `applyHint` derived from text/path),
+  forms (action, method, submit buttons), and per-field kind/type/name/label/placeholder/
+  autocomplete/required/readonly/disabled/sensitive/select-options. Field values are never
+  read or reported.
+- Page classification: `application_form` when fillable fields exist (reliability `observed`
+  at >= 3 fields, otherwise `heuristic`), `job_detail` from apply links + headings, else
+  `unknown`. ATS detection matches known hostnames (`greenhouse.io`, `lever.co`,
+  `myworkdayjobs.com`, `icims`, `smartrecruiters`, `jazzhr`) and on-page text
+  (e.g. "Powered by Greenhouse") and falls back to `UNKNOWN`/`low` when nothing matches.
+- Inspection is a read-only side questionnaire: it never updates job scored fields,
+  applications, or review events.
+- Tests use a local `node:http` fixture server on `127.0.0.1` and a shared `BrowserService`;
+  they never visit third-party sites. One test asserts that a full CLI `browser inspect-job`
+  run leaves applications and review history unchanged.
 
 ## Testing
 
