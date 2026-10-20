@@ -33,6 +33,10 @@ The compiled entry point is also the CLI:
 - `node dist/index.js applications list [--status S] [--limit N]`
 - `node dist/index.js applications show <id>` / `applications status <id> <STATUS> [--message TEXT]`
 - `node dist/index.js applications events <id>`
+- `node dist/index.js analytics [--source S] [--company NAME]`
+  — application pipeline metrics (funnel, response/interview/offer rates,
+    time-to-submit, per-source and per-company breakdowns); read-only over the
+    existing application lifecycle + `application_events`
 - `node dist/index.js browser inspect-job <jobId> [--headed] [--screenshot [PATH]] [--output PATH] [--timeout MS]`
   — open a job's URL in a read-only browser and report what is on it
 - `node dist/index.js browser inspect-url <url> [--headed] [--screenshot [PATH]] [--output PATH] [--timeout MS]`
@@ -47,7 +51,8 @@ Layers, from outside in:
 - `src/cli.ts` — async command dispatch for the compiled CLI; never holds business logic.
 - `src/db/` — SQLite connection, versioned migrations, diagnostics. No domain logic.
 - `src/domain/` — pure domain types, Zod schemas, status policy, normalization,
-  error classes, time helpers, and scoring types/constants. No SQL, no I/O, no `Date.now()`.
+  error classes, time helpers, scoring types/constants, and analytics aggregation.
+  No SQL, no I/O, no `Date.now()`.
 - `src/scoring/` — the deterministic scoring algorithm (`scoreJob.ts`) and the
   DB-backed orchestration (`scoreJobs.ts`). Depends on `src/domain/` types only.
 - `src/sources/` — job source adapters. Each adapter talks to one public, documented,
@@ -114,6 +119,28 @@ Key rules:
   opened or filled — it must represent a real submission.
 - `FAILED` recovers back to `IN_PROGRESS`.
 - `REJECTED` and `REJECTED_AFTER_INTERVIEW` are terminal.
+
+## Application analytics
+
+`analytics` derives outcome metrics deterministically from the existing application
+lifecycle and its audit events — no schema change, no extra writes.
+
+- `src/domain/analytics.ts` is pure: `computeApplicationAnalytics(rows)` takes
+  `AnalysisApplication` rows (application + job source + company name + its events)
+  and returns an `ApplicationAnalyticsReport`.
+- `src/repositories/analytics.ts#AnalyticsRepository.applicationRows()` loads every
+  application joined to `jobs.source` / `companies.name` plus all
+  `application_events` in two read queries. It never writes.
+- Metrics: current-status funnel; ever-reached counters (submitted / interview /
+  offer / rejected) derived from events, so an application that moved
+  `SUBMITTED -> INTERVIEW -> OFFER` counts as both reached-interview and offered;
+  submission / response / interview / offer rates; median + average time from
+  created to submitted; per-source and per-company breakdowns. A missing source or
+  company name groups under `unknown`.
+- `RESPONSE_STATUSES` (INTERVIEW, OFFER, REJECTED, REJECTED_AFTER_INTERVIEW) drive
+  "responded". Rates use submitted applications as the denominator and report an
+  `undefined` percentage when that denominator is 0.
+- CLI: `analytics [--source S] [--company NAME]` filters the rows before computing.
 
 ## Job review / triage
 

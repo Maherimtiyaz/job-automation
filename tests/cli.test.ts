@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { openDatabase } from "../src/db/connection.js";
 import { runCli } from "../src/cli.js";
+import { ApplicationRepository } from "../src/repositories/applications.js";
 import { CompanyRepository } from "../src/repositories/companies.js";
 import { JobRepository } from "../src/repositories/jobs.js";
 
@@ -460,6 +461,100 @@ test("browser inspect-job rejects a non-numeric job id", async () => {
     const code = await runCli(["browser", "inspect-job", "abc"]);
     assert.equal(code, 1);
     assert.ok(captured.errors.join("\n").includes("positive job id"));
+  } finally {
+    captured.restore();
+    env.cleanup();
+  }
+});
+
+test("analytics reports interaction with applications", async () => {
+  const env = tempEnv();
+  const captured = captureConsole();
+  try {
+    const db = openDatabase(process.env.DATABASE_PATH as string);
+    const company = new CompanyRepository(db).create({
+      name: "Acme",
+      website: "https://acme.test",
+    });
+    const job = new JobRepository(db).create({
+      companyId: company.id,
+      title: "Software Engineer Intern",
+      url: "https://acme.test/jobs/1",
+      source: "greenhouse",
+    });
+    const applications = new ApplicationRepository(db);
+    const app = applications.create({ jobId: job.id });
+    applications.transitionStatus(app.id, "IN_PROGRESS", {});
+    applications.transitionStatus(app.id, "APPROVED", {});
+    applications.transitionStatus(app.id, "SUBMITTED", {});
+    applications.transitionStatus(app.id, "INTERVIEW", {});
+    db.close();
+
+    const code = await runCli(["analytics"]);
+    assert.equal(code, 0);
+    const output = captured.logs.join("\n");
+    assert.ok(output.includes("Application analytics (1 application(s), 1 submitted):"));
+    assert.ok(output.includes("Funnel (current status):"));
+    assert.ok(output.includes("INTERVIEW"));
+    assert.ok(output.includes("response (of submitted): 100.0% (1/1)"));
+    assert.ok(output.includes("Ever reached (from audit history):"));
+    assert.ok(output.includes("submitted: 1"));
+    assert.ok(output.includes("By source (top 5):"));
+    assert.ok(output.includes("greenhouse"));
+  } finally {
+    captured.restore();
+    env.cleanup();
+  }
+});
+
+test("analytics filters by --source", async () => {
+  const env = tempEnv();
+  const captured = captureConsole();
+  try {
+    const db = openDatabase(process.env.DATABASE_PATH as string);
+    const company = new CompanyRepository(db).create({
+      name: "Acme",
+      website: "https://acme.test",
+    });
+    const greenhouseJob = new JobRepository(db).create({
+      companyId: company.id,
+      title: "Intern A",
+      url: "https://acme.test/jobs/a",
+      source: "greenhouse",
+    });
+    const leverJob = new JobRepository(db).create({
+      companyId: company.id,
+      title: "Intern B",
+      url: "https://acme.test/jobs/b",
+      source: "lever",
+    });
+    const applications = new ApplicationRepository(db);
+    applications.create({ jobId: greenhouseJob.id });
+    applications.transitionStatus(applications.create({ jobId: leverJob.id }).id, "IN_PROGRESS", {});
+    db.close();
+
+    const code = await runCli(["analytics", "--source", "greenhouse"]);
+    assert.equal(code, 0);
+    const output = captured.logs.join("\n");
+    assert.ok(output.includes("Application analytics (1 application(s)):"));
+    assert.ok(output.includes("DRAFT"));
+    assert.ok(!output.includes("lever"));
+  } finally {
+    captured.restore();
+    env.cleanup();
+  }
+});
+
+test("analytics on an empty database reports zero applications", async () => {
+  const env = tempEnv();
+  const captured = captureConsole();
+  try {
+    const code = await runCli(["analytics"]);
+    assert.equal(code, 0);
+    const output = captured.logs.join("\n");
+    assert.ok(output.includes("Application analytics (0 application(s)):"));
+    assert.ok(output.includes("median: -"));
+    assert.ok(output.includes("none"));
   } finally {
     captured.restore();
     env.cleanup();

@@ -11,6 +11,8 @@ import { DomainError } from "./domain/errors.js";
 import type { Job } from "./domain/job.js";
 import { RECOMMENDATIONS } from "./domain/job.js";
 import { normalizeCompanyName } from "./domain/normalize.js";
+import { computeApplicationAnalytics } from "./domain/analytics.js";
+import type { ApplicationAnalyticsReport, GroupBreakdown, RateMetric } from "./domain/analytics.js";
 import { describeProfileGaps } from "./domain/profile.js";
 import type { CandidateProfile } from "./domain/profile.js";
 import { REVIEW_STATUSES, ReviewStatusSchema, type ReviewStatus } from "./domain/review.js";
@@ -34,6 +36,7 @@ import {
   type AtsPlatform,
 } from "./registry/companyStore.js";
 import { ApplicationRepository } from "./repositories/applications.js";
+import { AnalyticsRepository } from "./repositories/analytics.js";
 import { CompanyRepository } from "./repositories/companies.js";
 import { JobRepository } from "./repositories/jobs.js";
 import { JobReviewRepository } from "./repositories/jobReviews.js";
@@ -80,6 +83,9 @@ Commands:
   applications show <id>
   applications status <id> <STATUS> [--message TEXT]
   applications events <id>
+  analytics [--source S] [--company NAME]
+                      Show application analytics: funnel, response/offer rates,
+                      and per-source / per-company breakdowns
   browser inspect-job <jobId> [--headed] [--screenshot [PATH]] [--output PATH]
                       [--timeout MS]
                       Open a job's URL in a read-only browser and report what is on it
@@ -189,6 +195,8 @@ export async function runCli(argv: readonly string[]): Promise<number> {
         return await runJobs(rest);
       case "applications":
         return await runApplications(rest);
+      case "analytics":
+        return await runAnalytics(rest);
       case "browser":
         return await runBrowser(rest);
       case "help":
@@ -1142,6 +1150,103 @@ async function runApplicationEvents(argv: readonly string[]): Promise<number> {
     }
     return 0;
   });
+}
+
+async function runAnalytics(argv: readonly string[]): Promise<number> {
+  const parsed = parseArgs(argv);
+  const sourceFilter = readFlag(parsed, "source");
+  const companyFilter = readFlag(parsed, "company");
+
+  return withDatabase((db) => {
+    const rows = new AnalyticsRepository(db).applicationRows();
+    const filtered = rows.filter(
+      (row) =>
+        (sourceFilter === undefined || row.source === sourceFilter) &&
+        (companyFilter === undefined || row.companyName === companyFilter),
+    );
+    printApplicationAnalytics(computeApplicationAnalytics(filtered));
+    return 0;
+  });
+}
+
+function formatRate(metric: RateMetric): string {
+  const percentage = metric.percentage === undefined ? "-" : `${metric.percentage.toFixed(1)}%`;
+  return `${percentage} (${metric.numerator}/${metric.denominator})`;
+}
+
+function formatHours(hours: number | null): string {
+  if (hours === null) {
+    return "-";
+  }
+  if (hours < 1) {
+    return `${Math.round(hours * 60)}m`;
+  }
+  return `${hours.toFixed(1)}h`;
+}
+
+function printGroupBreakdowns(title: string, groups: GroupBreakdown[]): void {
+  console.log(`\n${title} (top 5):`);
+  const top = groups.slice(0, 5);
+  if (top.length === 0) {
+    console.log("  none");
+    return;
+  }
+  for (const group of top) {
+    const responseRate =
+      group.submitted > 0 ? `${((group.responded / group.submitted) * 100).toFixed(1)}%` : "-";
+    console.log(
+      `  ${group.key}: ${group.applications} application(s), ` +
+        `${group.submitted} submitted, ${group.responded} responded (${responseRate}), ` +
+        `${group.offers} offer(s)`,
+    );
+  }
+}
+
+function printApplicationAnalytics(report: ApplicationAnalyticsReport): void {
+  console.log(
+    `Application analytics (${report.applications} application(s)` +
+      `${report.everSubmitted > 0 ? `, ${report.everSubmitted} submitted` : ""}):\n`,
+  );
+
+  console.log("Funnel (current status):");
+  const funnelRows = APPLICATION_STATUSES.filter((status) => (report.funnel[status] ?? 0) > 0);
+  for (const status of funnelRows) {
+    console.log(`  ${status.padEnd(24)}: ${report.funnel[status] ?? 0}`);
+  }
+
+  const { submission, response, interview, offer } = report.rates;
+  console.log("\nRates:");
+  console.log(`  submission (of all):    ${formatRate(submission)}`);
+  console.log(`  response (of submitted): ${formatRate(response)}`);
+  console.log(`  interview (of submitted): ${formatRate(interview)}`);
+  console.log(`  offer (of submitted):   ${formatRate(offer)}`);
+
+  console.log("\nEver reached (from audit history):");
+  console.log(
+    `  submitted: ${report.everSubmitted}  interview: ${report.everInterviewed}  ` +
+      `offer: ${report.everOffered}  rejected: ${report.everRejected}`,
+  );
+
+  const outcomes = report.outcomes;
+  console.log("\nOutcomes (current status):");
+  console.log(
+    `  pre-submission: ${outcomes.preSubmission}  pending-response: ${outcomes.pendingResponse}  ` +
+      `responded: ${outcomes.responded}  closed: ${outcomes.closed}`,
+  );
+  console.log(
+    `  offered: ${outcomes.offered}  rejected: ${outcomes.rejected}  ` +
+      `withdrawn: ${outcomes.withdrawn}  failed: ${outcomes.failed}`,
+  );
+
+  const time = report.timeToSubmit;
+  console.log("\nTime to submit:");
+  console.log(
+    `  median: ${formatHours(time.medianHours)}  average: ${formatHours(time.averageHours)}  ` +
+      `(over ${time.count} submitted application(s) with timestamps)`,
+  );
+
+  printGroupBreakdowns("By source", report.bySource);
+  printGroupBreakdowns("By company", report.byCompany);
 }
 
 async function runBrowser(argv: readonly string[]): Promise<number> {
