@@ -1,4 +1,5 @@
 import { z } from "zod";
+import type { ApplicationTargetSource } from "./applicationTarget.js";
 import type { ApplicationEventType, ApplicationStatus } from "./status.js";
 
 export const ApplicationCreateSchema = z.object({
@@ -19,6 +20,14 @@ export interface Application {
   lastUpdatedAt: string;
   notes: string | null;
   createdAt: string;
+  /** Resolved application target URL, or null when not prepared yet. */
+  applicationUrl: string | null;
+  /** How the target was found: the job URL itself or an Apply link. */
+  applicationUrlSource: ApplicationTargetSource | null;
+  /** Detected ATS platform for the target, or null when unknown. */
+  applicationAts: string | null;
+  /** When the target was last resolved (ISO 8601 UTC). */
+  applicationResolvedAt: string | null;
 }
 
 export interface ApplicationEvent {

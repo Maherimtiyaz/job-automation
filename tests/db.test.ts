@@ -176,7 +176,10 @@ test("migration v3 maps legacy application statuses and preserves history", () =
     );
 
     const applied = runMigrations(db);
-    assert.deepEqual([...applied], [3]);
+    const expectedApplied = MIGRATIONS.filter((migration) => migration.version > 2)
+      .map((migration) => migration.version)
+      .sort((left, right) => left - right);
+    assert.deepEqual([...applied], expectedApplied);
 
     const mapped = db.prepare("SELECT status FROM applications WHERE id = ?").get(reviewAppId) as {
       status: string;

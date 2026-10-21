@@ -1,6 +1,8 @@
 import type { Db } from "../db/connection.js";
 import type { Application, ApplicationEvent, TransitionOptions } from "../domain/application.js";
 import { ApplicationCreateSchema } from "../domain/application.js";
+import { ApplicationTargetSchema } from "../domain/applicationTarget.js";
+import type { ApplicationTargetSource } from "../domain/applicationTarget.js";
 import { ConflictError, NotFoundError, validationErrorFromZod } from "../domain/errors.js";
 import type { ApplicationStatus } from "../domain/status.js";
 import { assertTransition } from "../domain/status.js";
@@ -17,6 +19,10 @@ interface ApplicationRow {
   last_updated_at: string;
   notes: string | null;
   created_at: string;
+  application_url: string | null;
+  application_url_source: string | null;
+  application_ats: string | null;
+  application_resolved_at: string | null;
 }
 
 const INSERT_APPLICATION = `
@@ -34,6 +40,16 @@ UPDATE applications SET
 WHERE id = @id
 `;
 
+const UPDATE_APPLICATION_TARGET = `
+UPDATE applications SET
+  application_url = @applicationUrl,
+  application_url_source = @applicationUrlSource,
+  application_ats = @applicationAts,
+  application_resolved_at = @applicationResolvedAt,
+  last_updated_at = @lastUpdatedAt
+WHERE id = @id
+`;
+
 function mapApplication(row: ApplicationRow): Application {
   return {
     id: row.id,
@@ -45,6 +61,10 @@ function mapApplication(row: ApplicationRow): Application {
     lastUpdatedAt: row.last_updated_at,
     notes: row.notes,
     createdAt: row.created_at,
+    applicationUrl: row.application_url,
+    applicationUrlSource: row.application_url_source as ApplicationTargetSource | null,
+    applicationAts: row.application_ats,
+    applicationResolvedAt: row.application_resolved_at,
   };
 }
 
@@ -132,6 +152,30 @@ export class ApplicationRepository {
     });
     run();
 
+    return this.getById(id);
+  }
+
+  /**
+   * Persist the resolved application target. This is a data-only update: the
+   * lifecycle audit stays on transitionStatus(), so preparation flows record
+   * DRAFT -> IN_PROGRESS -> WAITING_FOR_HUMAN as their audit trail.
+   */
+  setApplicationTarget(id: number, input: unknown): Application {
+    const parsed = ApplicationTargetSchema.safeParse(input);
+    if (!parsed.success) {
+      throw validationErrorFromZod("Invalid application target", parsed.error);
+    }
+
+    this.getById(id);
+    const timestamp = nowIso();
+    this.db.prepare(UPDATE_APPLICATION_TARGET).run({
+      id,
+      applicationUrl: parsed.data.url,
+      applicationUrlSource: parsed.data.source,
+      applicationAts: parsed.data.atsPlatform ?? null,
+      applicationResolvedAt: timestamp,
+      lastUpdatedAt: timestamp,
+    });
     return this.getById(id);
   }
 

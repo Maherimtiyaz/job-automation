@@ -1,9 +1,10 @@
 import type { AppConfig } from "./config.js";
 import { ConfigError, loadConfig } from "./config.js";
 import { BrowserService } from "./browser/browserService.js";
+import { resolveApplyTarget } from "./browser/applyTarget.js";
 import { buildFillPlan } from "./browser/fillPlan.js";
 import { printFillPlan, printInspectionReport, writeInspectionReport } from "./browser/report.js";
-import type { InspectOperationOptions } from "./browser/types.js";
+import type { InspectOperationOptions, InspectionReport } from "./browser/types.js";
 import { validateInspectUrl } from "./browser/urlPolicy.js";
 import type { Db } from "./db/connection.js";
 import { openDatabase } from "./db/connection.js";
@@ -119,6 +120,10 @@ Commands:
                       Set the default resume/cover letter for its kind
   applications list [--status S] [--limit N]
   applications show <id>
+  applications prepare <id> [--target URL] [--headed] [--screenshot [PATH]]
+                      [--output PATH] [--timeout MS] [--fill-plan] [--show-values]
+                      Resolve the real application target in a read-only browser and
+                      hand off for human review (never fills or submits)
   applications status <id> <STATUS> [--message TEXT]
   applications events <id>
   analytics [--source S] [--company NAME]
@@ -139,6 +144,7 @@ Options:
   --screenshot        Save a screenshot (default: screenshots/inspect-<timestamp>.png)
   --output PATH       Write the inspection report as JSON to PATH
   --timeout MS        Navigation timeout in milliseconds (default: 15000)
+  --target URL        Explicit application URL to use instead of resolving the Apply link
   --fill-plan         Map detected form fields to profile data (read-only; never fills)
   --show-values       Include profile values in the fill plan (redacted by default)
   --resume ID         Attach a resume from the store by id (applications create)
@@ -1169,6 +1175,8 @@ async function runApplications(argv: readonly string[]): Promise<number> {
       return await runApplicationList(rest);
     case "show":
       return await runApplicationShow(rest);
+    case "prepare":
+      return await runApplicationPrepare(rest);
     case "status":
       return await runApplicationStatus(rest);
     case "events":
@@ -1176,7 +1184,7 @@ async function runApplications(argv: readonly string[]): Promise<number> {
     default:
       if (subcommand === "") {
         console.error(
-          "Error: missing applications subcommand (create | list | show | status | events).",
+          "Error: missing applications subcommand (create | list | show | prepare | status | events).",
         );
         return 1;
       }
@@ -1291,6 +1299,10 @@ function printApplication(
   console.log(`  Created:  ${app.createdAt}`);
   console.log(`  Updated:  ${app.lastUpdatedAt}`);
   console.log(`  Resume:   ${resumeLabel}`);
+  console.log(`  Target:   ${app.applicationUrl ?? "-"}`);
+  console.log(`  Source:   ${app.applicationUrlSource ?? "-"}`);
+  console.log(`  ATS:      ${app.applicationAts ?? "-"}`);
+  console.log(`  Resolved: ${app.applicationResolvedAt ?? "-"}`);
   console.log(`  Notes:    ${app.notes ?? "-"}`);
 }
 
@@ -1311,6 +1323,159 @@ async function runApplicationShow(argv: readonly string[]): Promise<number> {
     printApplication(jobs, companies, app, describeResumeVersion(registry, app.resumeVersion));
     return 0;
   });
+}
+
+async function runApplicationPrepare(argv: readonly string[]): Promise<number> {
+  const parsed = parseArgs(argv);
+  const id = Number(parsed.positionals[0]);
+  if (!Number.isSafeInteger(id) || id <= 0) {
+    console.error(
+      "Error: applications prepare requires a positive application id (e.g. applications prepare 1).",
+    );
+    return 1;
+  }
+
+  const headed = parsed.flags["headed"] === true;
+  const screenshot = parsed.flags["screenshot"];
+  const output = readFlag(parsed, "output");
+  const timeout = readIntFlag(parsed, "timeout", 0);
+  const wantsFillPlan = parsed.flags["fill-plan"] === true;
+  const showValues = parsed.flags["show-values"] === true;
+  const explicitTarget = readFlag(parsed, "target");
+
+  const loaded = await withDatabase((db) => {
+    const applications = new ApplicationRepository(db);
+    const app = applications.getById(id);
+    const job = new JobRepository(db).getById(app.jobId);
+    return { app, job };
+  });
+
+  if (loaded.app.status !== "DRAFT" && loaded.app.status !== "IN_PROGRESS") {
+    console.error(
+      `Error: application ${id} is ${loaded.app.status}; only DRAFT or IN_PROGRESS applications can be prepared.`,
+    );
+    return 1;
+  }
+
+  const service = new BrowserService({
+    headless: !headed,
+    ...(timeout !== undefined ? { navigationTimeoutMs: timeout } : {}),
+  });
+
+  const options: InspectOperationOptions = {};
+  if (screenshot !== undefined) {
+    options.screenshot = screenshot === true ? true : screenshot;
+  }
+  if (timeout !== undefined) {
+    options.navigationTimeoutMs = timeout;
+  }
+
+  try {
+    let targetUrl: string;
+    let targetSource: "job_url" | "apply_link";
+    let resolutionReason: string;
+    let targetReport: InspectionReport;
+
+    if (explicitTarget !== undefined) {
+      targetUrl = validateInspectUrl(explicitTarget).href;
+      targetSource = targetUrl === loaded.job.canonicalUrl ? "job_url" : "apply_link";
+      resolutionReason = "Application target supplied with --target.";
+      targetReport = await service.inspect(targetUrl, options);
+    } else {
+      console.log(
+        `Resolving the application target for application ${id} from ${loaded.job.canonicalUrl} ...`,
+      );
+      const jobReport = await service.inspect(loaded.job.canonicalUrl, options);
+      if (jobReport.status !== "ok") {
+        const details = jobReport.problems.map((problem) => problem.message).join("; ");
+        console.error(`Error: could not inspect the job page. ${details}`);
+        return 1;
+      }
+
+      if (jobReport.hasApplicationForm === true) {
+        targetUrl = jobReport.finalUrl ?? jobReport.requestedUrl;
+        targetSource = "job_url";
+        resolutionReason = "The job page is already an application form.";
+        targetReport = jobReport;
+      } else {
+        const resolution = resolveApplyTarget({
+          pageUrl: jobReport.finalUrl ?? jobReport.requestedUrl,
+          applyLinks: jobReport.applyLinks,
+          links: jobReport.links,
+        });
+        if (resolution.url === null) {
+          console.error(
+            `Error: ${resolution.reason} Re-run with --target <url> to set the application URL explicitly.`,
+          );
+          return 1;
+        }
+        targetUrl = resolution.url;
+        targetSource = "apply_link";
+        resolutionReason = resolution.reason;
+        targetReport = await service.inspect(targetUrl, options);
+      }
+    }
+
+    if (wantsFillPlan) {
+      targetReport.fillPlan = buildFillPlan({
+        forms: targetReport.forms,
+        profile: loadProfileForFillPlan(),
+        resumes: loadResumeRegistryForFillPlan(),
+        pageKind: targetReport.pageKind,
+        hasApplicationForm: targetReport.hasApplicationForm,
+        includeValues: showValues,
+      });
+    }
+
+    if (output !== undefined) {
+      writeInspectionReport(output, targetReport);
+    }
+
+    const atsPlatform = targetReport.ats.platform === "UNKNOWN" ? null : targetReport.ats.platform;
+
+    const updated = await withDatabase((db) => {
+      const applications = new ApplicationRepository(db);
+      let application = applications.setApplicationTarget(id, {
+        url: targetUrl,
+        source: targetSource,
+        atsPlatform,
+      });
+      if (application.status === "DRAFT") {
+        application = applications.transitionStatus(id, "IN_PROGRESS", {
+          message: `Preparing application target: ${targetUrl}`,
+        });
+      }
+      if (targetReport.hasApplicationForm === true && application.status === "IN_PROGRESS") {
+        application = applications.transitionStatus(id, "WAITING_FOR_HUMAN", {
+          message: `Application form ready for human review: ${targetUrl}`,
+        });
+      }
+      return application;
+    });
+
+    printInspectionReport(targetReport);
+    if (targetReport.fillPlan !== null && targetReport.fillPlan !== undefined) {
+      printFillPlan(targetReport.fillPlan);
+    }
+
+    console.log(`Application ${id}: ${updated.status}`);
+    console.log(`  Job:     ${loaded.job.title}`);
+    console.log(`  Target:  ${targetUrl}`);
+    console.log(`  Source:  ${targetSource}`);
+    console.log(`  ATS:     ${atsPlatform ?? "UNKNOWN"}`);
+    console.log(`  Reason:  ${resolutionReason}`);
+    console.log(
+      targetReport.hasApplicationForm === true
+        ? "Application form detected. Nothing was filled or submitted; review it and apply manually."
+        : "No application form was detected on the target. The URL was recorded for review.",
+    );
+    if (output !== undefined) {
+      console.log(`Wrote inspection report to ${output}.`);
+    }
+    return 0;
+  } finally {
+    await service.close();
+  }
 }
 
 function describeResumeVersion(registry: ResumeRegistry | null, version: string | null): string {

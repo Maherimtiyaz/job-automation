@@ -21,6 +21,10 @@ function makeApplication(overrides: Partial<Application> = {}): Application {
     lastUpdatedAt: "2026-01-01T00:00:00.000Z",
     notes: null,
     createdAt: "2026-01-01T00:00:00.000Z",
+    applicationUrl: null,
+    applicationUrlSource: null,
+    applicationAts: null,
+    applicationResolvedAt: null,
     ...overrides,
   };
 }

@@ -33,6 +33,9 @@ The compiled entry point is also the CLI:
 - `node dist/index.js applications list [--status S] [--limit N]`
 - `node dist/index.js applications show <id>` / `applications status <id> <STATUS> [--message TEXT]`
 - `node dist/index.js applications events <id>`
+- `node dist/index.js applications prepare <id> [--target URL] [--headed] [--screenshot [PATH]] [--output PATH] [--timeout MS] [--fill-plan] [--show-values]`
+  — resolve the real application target in a read-only browser, record it, and hand
+    off to a human at `WAITING_FOR_HUMAN`; never fills or submits
 - `node dist/index.js resumes:init [--force]` / `resumes:list`
 - `node dist/index.js resumes:add --file <path> [--id ID] [--label TEXT] [--kind resume|cover_letter] [--default] [--notes TEXT]`
 - `node dist/index.js resumes:default --id ID` / `resumes:remove --id ID`
@@ -414,6 +417,30 @@ clicks nothing, and never submits — it is a decision report layered on top of 
 - Resume-file and cover-letter fields are always `NEEDS_INPUT` (no resume store yet).
 - The plan is attached as the optional `fillPlan` field of `InspectionReport`; without
   `--fill-plan` the report is unchanged. Printing lives in `report.ts#printFillPlan`.
+
+## Application preparation (read-only)
+
+`applications prepare <id>` turns a job into a reviewable application target. It is a
+tracker operation plus a read-only browser navigation: it records where the application
+would be submitted and stops for a human.
+
+- Migration v4 (`application_target`) adds `applications.application_url`,
+  `application_url_source` (`job_url` | `apply_link`), `application_ats`, and
+  `application_resolved_at`. `ApplicationRepository#setApplicationTarget` validates and
+  persists the target; it is a data-only update with no lifecycle event.
+- `src/browser/applyTarget.ts` is pure: `resolveApplyTarget({ pageUrl, applyLinks, links })`
+  deterministically picks the first usable Apply link (ignoring the page itself,
+  non-HTTP(S) URLs, credentialed URLs, and duplicates) and reports all candidates.
+- Flow: inspect the job URL read-only. If the posting is already an application form,
+  use it (`source: "job_url"`); otherwise resolve and inspect the Apply link
+  (`source: "apply_link"`). Then `setApplicationTarget`, and move
+  `DRAFT -> IN_PROGRESS -> WAITING_FOR_HUMAN` when a form is present. `--target URL`
+  bypasses resolution.
+- Safety: the command never fills fields, clicks controls, uploads files, or submits.
+  `SUBMITTED` remains reachable only from `APPROVED`. A failed resolution leaves the
+  application untouched (still `DRAFT`).
+- Tests use a local `node:http` fixture server and assert the persisted target, the
+  audit trail (`DRAFT -> IN_PROGRESS -> WAITING_FOR_HUMAN`), and the safe failure path.
 
 ## Testing
 

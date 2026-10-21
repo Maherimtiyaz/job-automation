@@ -206,6 +206,16 @@ CREATE INDEX idx_jobs_score_total ON jobs (score_total);
 CREATE INDEX idx_jobs_score_recommendation ON jobs (score_recommendation);
 `;
 
+export const APPLICATION_TARGET = `
+ALTER TABLE applications ADD COLUMN application_url TEXT;
+ALTER TABLE applications ADD COLUMN application_url_source TEXT
+  CHECK (application_url_source IS NULL OR application_url_source IN ('job_url', 'apply_link'));
+ALTER TABLE applications ADD COLUMN application_ats TEXT;
+ALTER TABLE applications ADD COLUMN application_resolved_at TEXT;
+
+CREATE INDEX idx_applications_application_url ON applications (application_url);
+`;
+
 export const MIGRATIONS: readonly Migration[] = [
   {
     version: 1,
@@ -226,6 +236,13 @@ export const MIGRATIONS: readonly Migration[] = [
     name: "review_and_lifecycle",
     up: (db) => {
       db.exec(REVIEW_AND_LIFECYCLE);
+    },
+  },
+  {
+    version: 4,
+    name: "application_target",
+    up: (db) => {
+      db.exec(APPLICATION_TARGET);
     },
   },
 ];

@@ -13,6 +13,10 @@ interface ApplicationAnalyticsRow {
   last_updated_at: string;
   notes: string | null;
   created_at: string;
+  application_url: string | null;
+  application_url_source: string | null;
+  application_ats: string | null;
+  application_resolved_at: string | null;
   job_source: string | null;
   company_name: string | null;
 }
@@ -75,6 +79,10 @@ export class AnalyticsRepository {
         lastUpdatedAt: row.last_updated_at,
         notes: row.notes,
         createdAt: row.created_at,
+        applicationUrl: row.application_url,
+        applicationUrlSource: row.application_url_source as Application["applicationUrlSource"],
+        applicationAts: row.application_ats,
+        applicationResolvedAt: row.application_resolved_at,
       };
       return {
         application,
