@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -46,6 +46,7 @@ function tempEnv(): { dir: string; cleanup(): void } {
   process.env.DATABASE_PATH = join(dir, "test.db");
   process.env.PROFILE_PATH = join(dir, "profile.json");
   process.env.COMPANIES_PATH = join(dir, "companies.json");
+  process.env.RESUME_PATH = join(dir, "resumes.json");
   return {
     dir,
     cleanup: () => {
@@ -395,6 +396,143 @@ test("applications create/list/status/events workflow", async () => {
     captured.clear();
     assert.equal(await runCli(["applications", "create", "1"]), 1);
     assert.ok(captured.errors.join("\n").includes("already exists"));
+  } finally {
+    captured.restore();
+    env.cleanup();
+  }
+});
+
+test("resumes store round-trips through the CLI", async () => {
+  const env = tempEnv();
+  const captured = captureConsole();
+  try {
+    const resumePath = join(env.dir, "Ada_Resume.pdf");
+    writeFileSync(resumePath, "%PDF fake", "utf8");
+    const coverPath = join(env.dir, "Ada_Cover.pdf");
+    writeFileSync(coverPath, "%PDF fake", "utf8");
+
+    assert.equal(await runCli(["resumes:init"]), 0);
+    assert.ok(captured.logs.join("\n").includes("Wrote resume registry template"));
+
+    captured.clear();
+    assert.equal(await runCli(["resumes:add", "--file", resumePath, "--default"]), 0);
+    assert.ok(captured.logs.join("\n").includes('Added resume "Ada_Resume" [ada-resume]'));
+
+    captured.clear();
+    assert.equal(
+      await runCli(["resumes:add", "--file", coverPath, "--kind", "cover_letter", "--default"]),
+      0,
+    );
+    assert.ok(captured.logs.join("\n").includes("Ada_Cover"));
+
+    captured.clear();
+    assert.equal(await runCli(["resumes:list"]), 0);
+    const listLog = captured.logs.join("\n");
+    assert.ok(listLog.includes("[resume] ada-resume"));
+    assert.ok(listLog.includes("[cover_letter] ada-cover"));
+    assert.ok(listLog.includes("*default"));
+
+    captured.clear();
+    assert.equal(await runCli(["resumes:remove", "--id", "ada-cover"]), 0);
+    assert.ok(captured.logs.join("\n").includes("Removed cover_letter"));
+
+    captured.clear();
+    assert.equal(await runCli(["resumes:list"]), 0);
+    const after = captured.logs.join("\n");
+    assert.ok(!after.includes("ada-cover"));
+    assert.ok(after.includes("ada-resume"));
+  } finally {
+    captured.restore();
+    env.cleanup();
+  }
+});
+
+test("resumes:add without a registry explains the next step", async () => {
+  const env = tempEnv();
+  const captured = captureConsole();
+  try {
+    const resumePath = join(env.dir, "plain.pdf");
+    writeFileSync(resumePath, "%PDF fake", "utf8");
+    const code = await runCli(["resumes:add", "--file", resumePath]);
+    assert.equal(code, 1);
+    assert.ok(captured.errors.join("\n").includes("resumes:init"));
+  } finally {
+    captured.restore();
+    env.cleanup();
+  }
+});
+
+test("resumes:add rejects an unsupported file type", async () => {
+  const env = tempEnv();
+  const captured = captureConsole();
+  try {
+    await runCli(["resumes:init"]);
+    const exePath = join(env.dir, "resume.exe");
+    writeFileSync(exePath, "binary", "utf8");
+
+    captured.clear();
+    const code = await runCli(["resumes:add", "--file", exePath]);
+    assert.equal(code, 1);
+    assert.ok(captured.errors.join("\n").includes("unsupported extension"));
+  } finally {
+    captured.restore();
+    env.cleanup();
+  }
+});
+
+test("applications create attaches the store default resume", async () => {
+  const env = tempEnv();
+  const captured = captureConsole();
+  try {
+    const db = openDatabase(process.env.DATABASE_PATH as string);
+    const company = new CompanyRepository(db).create({ name: "Acme" });
+    new JobRepository(db).create({
+      companyId: company.id,
+      title: "Backend Engineer",
+      url: "https://acme.test/jobs/1",
+      source: "greenhouse",
+      externalJobId: "1",
+    });
+    db.close();
+
+    const resumePath = join(env.dir, "Ada_Resume.pdf");
+    writeFileSync(resumePath, "%PDF fake", "utf8");
+    await runCli(["resumes:init"]);
+    await runCli(["resumes:add", "--file", resumePath, "--default"]);
+
+    captured.clear();
+    assert.equal(await runCli(["applications", "create", "1", "--default-resume"]), 0);
+    const created = captured.logs.join("\n");
+    assert.ok(created.includes("Created application 1"));
+    assert.ok(created.includes("[resume ada-resume]"));
+
+    captured.clear();
+    assert.equal(await runCli(["applications", "show", "1"]), 0);
+    assert.ok(captured.logs.join("\n").includes("Resume:   Ada_Resume [ada-resume]"));
+  } finally {
+    captured.restore();
+    env.cleanup();
+  }
+});
+
+test("applications create --default-resume errors without a stored default", async () => {
+  const env = tempEnv();
+  const captured = captureConsole();
+  try {
+    const db = openDatabase(process.env.DATABASE_PATH as string);
+    const company = new CompanyRepository(db).create({ name: "Acme" });
+    new JobRepository(db).create({
+      companyId: company.id,
+      title: "Backend Engineer",
+      url: "https://acme.test/jobs/1",
+      source: "greenhouse",
+      externalJobId: "1",
+    });
+    db.close();
+
+    const code = await runCli(["applications", "create", "1", "--default-resume"]);
+    assert.equal(code, 1);
+    assert.ok(captured.errors.join("\n").includes("no default resume"));
   } finally {
     captured.restore();
     env.cleanup();

@@ -1,6 +1,35 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
-import type { InspectionReport } from "./types.js";
+import type { FillPlan, InspectionReport } from "./types.js";
+
+export function printFillPlan(plan: FillPlan): void {
+  console.log(
+    `Fill plan (read-only, nothing is filled or submitted): ${plan.summary.fields} field(s), profile ${plan.profileLoaded ? "loaded" : "not loaded"}`,
+  );
+  console.log(
+    `  provide ${plan.summary.provide}, needs input ${plan.summary.needsInput}, skip ${plan.summary.skip}; required needing input ${plan.summary.requiredNeedsInput}`,
+  );
+  for (const entry of plan.entries) {
+    const label = entry.label ?? entry.name ?? entry.field;
+    const type = entry.inputType !== null ? ` type=${entry.inputType}` : "";
+    const requirement = entry.required ? " [required]" : "";
+    const target = entry.target ?? "-";
+    const value =
+      entry.value !== null
+        ? ` value="${entry.value}"`
+        : entry.valueHidden
+          ? " value=<redacted>"
+          : "";
+    const document = entry.document ? ` [attach: ${entry.document.fileName}]` : "";
+    console.log(
+      `  [${entry.decision}] ${label} (${entry.field}, ${entry.kind}${type})${requirement} -> ${target}${value}${document}`,
+    );
+    console.log(`      ${entry.reason}`);
+  }
+  for (const warning of plan.warnings) {
+    console.log(`  Warning: ${warning.message}`);
+  }
+}
 
 export function printInspectionReport(report: InspectionReport): void {
   const statusLabel = report.status === "failed" ? "FAILED" : "ok";

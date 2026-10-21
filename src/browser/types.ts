@@ -99,6 +99,69 @@ export interface InspectedPageParts {
   textSample: string;
 }
 
+export type FillTarget =
+  | "fullName"
+  | "firstName"
+  | "lastName"
+  | "email"
+  | "phone"
+  | "location"
+  | "headline"
+  | "linkedinUrl"
+  | "githubUrl"
+  | "websiteUrl"
+  | "minimumSalary"
+  | "resume"
+  | "coverLetter";
+
+export type FillDecision = "PROVIDE" | "NEEDS_INPUT" | "SKIP";
+
+export type FillMatchConfidence = "autocomplete" | "inputType" | "name" | "label" | "placeholder";
+
+export type FillDocumentKind = "resume" | "cover_letter";
+
+export interface FillDocumentRef {
+  id: string;
+  label: string;
+  kind: FillDocumentKind;
+  fileName: string;
+}
+
+export interface FillPlanEntry {
+  field: string;
+  kind: FieldKind;
+  inputType: string | null;
+  name: string | null;
+  label: string | null;
+  required: boolean;
+  sensitive: boolean;
+  target: FillTarget | null;
+  decision: FillDecision;
+  value: string | null;
+  valueHidden: boolean;
+  confidence: FillMatchConfidence | null;
+  document?: FillDocumentRef | null;
+  reason: string;
+}
+
+export interface FillPlanSummary {
+  forms: number;
+  fields: number;
+  provide: number;
+  needsInput: number;
+  skip: number;
+  requiredNeedsInput: number;
+}
+
+export interface FillPlan {
+  profileLoaded: boolean;
+  pageKind: PageKind;
+  hasApplicationForm: boolean | null;
+  summary: FillPlanSummary;
+  entries: readonly FillPlanEntry[];
+  warnings: readonly InspectionWarning[];
+}
+
 export interface InspectionReport {
   status: "ok" | "failed";
   requestedUrl: string;
@@ -120,6 +183,7 @@ export interface InspectionReport {
   hiddenFieldCount: number;
   warnings: readonly InspectionWarning[];
   problems: readonly InspectionProblem[];
+  fillPlan?: FillPlan | null;
 }
 
 export interface InspectOperationOptions {

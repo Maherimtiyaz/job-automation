@@ -29,17 +29,20 @@ The compiled entry point is also the CLI:
 - `node dist/index.js jobs review [--limit N] [--min-score N] [--state S] [--include-all]`
 - `node dist/index.js jobs shortlist <id> [--reason TEXT]` / `jobs dismiss <id> [--reason TEXT]`
 - `node dist/index.js jobs ready <id>` / `jobs reopen <id>` / `jobs review-history <id>`
-- `node dist/index.js applications create <jobId> [--resume VERSION] [--notes TEXT]`
+- `node dist/index.js applications create <jobId> [--resume VERSION | --default-resume] [--notes TEXT]`
 - `node dist/index.js applications list [--status S] [--limit N]`
 - `node dist/index.js applications show <id>` / `applications status <id> <STATUS> [--message TEXT]`
 - `node dist/index.js applications events <id>`
+- `node dist/index.js resumes:init [--force]` / `resumes:list`
+- `node dist/index.js resumes:add --file <path> [--id ID] [--label TEXT] [--kind resume|cover_letter] [--default] [--notes TEXT]`
+- `node dist/index.js resumes:default --id ID` / `resumes:remove --id ID`
 - `node dist/index.js analytics [--source S] [--company NAME]`
   — application pipeline metrics (funnel, response/interview/offer rates,
     time-to-submit, per-source and per-company breakdowns); read-only over the
     existing application lifecycle + `application_events`
-- `node dist/index.js browser inspect-job <jobId> [--headed] [--screenshot [PATH]] [--output PATH] [--timeout MS]`
+- `node dist/index.js browser inspect-job <jobId> [--headed] [--screenshot [PATH]] [--output PATH] [--timeout MS] [--fill-plan] [--show-values]`
   — open a job's URL in a read-only browser and report what is on it
-- `node dist/index.js browser inspect-url <url> [--headed] [--screenshot [PATH]] [--output PATH] [--timeout MS]`
+- `node dist/index.js browser inspect-url <url> [--headed] [--screenshot [PATH]] [--output PATH] [--timeout MS] [--fill-plan] [--show-values]`
   — inspect an arbitrary URL with a read-only browser; nothing is filled or submitted
 
 ## Architecture
@@ -47,7 +50,8 @@ The compiled entry point is also the CLI:
 Layers, from outside in:
 
 - `src/config.ts` — Zod-validated environment configuration (`NODE_ENV`, `DATABASE_PATH`,
-  `PROFILE_PATH`, `COMPANIES_PATH`, `RELEVANCE_MIN_SCORE`, `RELEVANCE_MIN_ROLE_SCORE`).
+  `PROFILE_PATH`, `COMPANIES_PATH`, `RESUME_PATH`, `RELEVANCE_MIN_SCORE`,
+  `RELEVANCE_MIN_ROLE_SCORE`).
 - `src/cli.ts` — async command dispatch for the compiled CLI; never holds business logic.
 - `src/db/` — SQLite connection, versioned migrations, diagnostics. No domain logic.
 - `src/domain/` — pure domain types, Zod schemas, status policy, normalization,
@@ -62,6 +66,8 @@ Layers, from outside in:
 - `src/registry/` — the company registry JSON file: which companies to discover, their ATS
   platform, and the board token for that platform.
 - `src/profile/` — reading/writing the candidate profile JSON file.
+- `src/resume/` — the resume registry JSON file: which resume/cover-letter files exist,
+  their kind, and which is the default per kind. Stores file *references* only.
 - `src/ingest/` — the ingestion pipeline: fetch listings per enabled company, dedupe,
   upsert, rescore when needed, and produce a summary.
 - `src/repositories/` — data access. Accept `unknown` at the boundary, validate with
@@ -263,6 +269,12 @@ template from `createEmptyProfile()`. The template only fills the four known tar
 invented here. `src/domain/profile.ts` owns the Zod schema; `src/profile/profileStore.ts`
 owns file I/O and surfaces `ProfileNotFoundError` for missing files.
 
+The schema includes optional contact fields beyond scoring: `fullName`, `headline`, `email`,
+`phone`, `location`, `linkedinUrl`, `githubUrl`, `websiteUrl`. These feed the read-only form
+fill plan (see "Application fill plan"); `describeProfileGaps` flags a missing `email` and
+`phone` because they block contact-form autofill. `email` is validated as an email; the URL
+fields accept any non-empty string.
+
 ## Company registry
 
 Stored as a local JSON file at `COMPANIES_PATH` (default `data/companies.json`), never
@@ -277,6 +289,22 @@ Lever posting site), and `active` (default `true`). `boardToken` is required whe
 directly to this file. The registry is separate from the `companies` SQL table (which is the
 FK target for jobs and holds only name/website/careers_url/ats_platform; board tokens stay
 in the JSON file, never in the database).
+
+## Resume store
+
+Stored as a local JSON file at `RESUME_PATH` (default `data/resumes.json`), never committed.
+Owned by `src/resume/resumeStore.ts`; the file shape is `{ "version": 1, "resumes": [...] }`,
+validated by `ResumeRegistrySchema` (`src/domain/resume.ts`). The store keeps **file
+references only** — it never copies, opens, or uploads resume content.
+
+Each entry has `id`, `label`, `kind` (`resume` | `cover_letter`, default `resume`),
+`filePath` (a resolved absolute path), `isDefault` (default `false`), optional `notes`, and
+`createdAt`. At most one document per kind is the default; marking or setting a default
+clears the previous default of the same kind only. `resumes:add` validates that the file
+exists, is a regular file, and has an allowed extension
+(`.pdf .doc .docx .txt .md .rtf .odt`), then derives an id from the label (slugified, made
+unique) unless one is given. Allowed kinds live in `RESUME_KINDS`; helpers `findResume`
+(case-insensitive) and `defaultResumeForKind` are pure.
 
 ## Job discovery sources
 
@@ -355,6 +383,37 @@ handle authentication, and never touch `applications`/`review_events`.
 - Tests use a local `node:http` fixture server on `127.0.0.1` and a shared `BrowserService`;
   they never visit third-party sites. One test asserts that a full CLI `browser inspect-job`
   run leaves applications and review history unchanged.
+
+## Application fill plan (read-only)
+
+`--fill-plan` maps the detected form fields to candidate-profile data and prints an explicit,
+reviewable plan (`field -> value/source` or `NEEDS_INPUT`/`SKIP`). It still fills nothing,
+clicks nothing, and never submits — it is a decision report layered on top of inspection.
+
+- `src/browser/fillPlan.ts` is pure: `buildFillPlan({ forms, profile, resumes, pageKind, hasApplicationForm, includeValues })`
+  takes the inspected forms, an optional `CandidateProfile`, and an optional `ResumeRegistry`
+  and returns a `FillPlan` (`FillPlanEntry[]` + summary + warnings). It reads no page values
+  and performs no I/O.
+- Decisions: `PROVIDE` (a profile value or stored resume document exists), `NEEDS_INPUT`
+  (mapped but the profile has no value, or an unmapped required field / work-authorization
+  question / manual attachment with no stored default), `SKIP` (sensitive inputs,
+  disabled/readonly fields, EEO-demographic and source/referral questions, unmapped
+  optional fields).
+- Resume / cover-letter fields resolve to the resume store's default document for that kind:
+  when one is configured the entry becomes `PROVIDE` with a `document` reference
+  (`{ id, label, kind, fileName }` — only the basename is exposed, never the full path) and no
+  value; otherwise it stays `NEEDS_INPUT` with a store-aware reason ("no default resume in the
+  resume store" vs. "no resume store configured"). `buildFillPlan` receives the registry via
+  its `resumes` option; the CLI supplies it from `RESUME_PATH` with
+  `loadResumeRegistryForFillPlan()`.
+- Matching is deterministic and ordered: `autocomplete` > `name` tokens > `label` tokens >
+  `placeholder` tokens > `inputType`. First/last name are derived from `fullName`; a bare
+  `name` field is not treated as a person name when company/institution tokens are present.
+- Values are **redacted by default** in both console output and the sanitized JSON report;
+  `--show-values` includes them explicitly. Sensitive fields never carry a value.
+- Resume-file and cover-letter fields are always `NEEDS_INPUT` (no resume store yet).
+- The plan is attached as the optional `fillPlan` field of `InspectionReport`; without
+  `--fill-plan` the report is unchanged. Printing lives in `report.ts#printFillPlan`.
 
 ## Testing
 

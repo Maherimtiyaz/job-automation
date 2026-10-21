@@ -62,7 +62,12 @@ export const TargetRoleSchema = z.object({
 export const CandidateProfileSchema = z.object({
   fullName: z.string().trim().min(1).nullish(),
   headline: z.string().trim().min(1).nullish(),
+  email: z.email().nullish(),
+  phone: z.string().trim().min(1).nullish(),
   location: z.string().trim().min(1).nullish(),
+  linkedinUrl: z.string().trim().min(1).nullish(),
+  githubUrl: z.string().trim().min(1).nullish(),
+  websiteUrl: z.string().trim().min(1).nullish(),
   targetRoles: z.array(TargetRoleSchema).default([]),
   skills: z.array(SkillSchema).default([]),
   workExperience: z.array(WorkExperienceSchema).default([]),
@@ -82,7 +87,12 @@ export function createEmptyProfile(): CandidateProfile {
   return CandidateProfileSchema.parse({
     fullName: null,
     headline: null,
+    email: null,
+    phone: null,
     location: null,
+    linkedinUrl: null,
+    githubUrl: null,
+    websiteUrl: null,
     targetRoles: TARGET_ROLES.map((role) => ({ role, priority: 3 })),
     skills: [],
     workExperience: [],
@@ -102,6 +112,12 @@ export function describeProfileGaps(profile: CandidateProfile): ProfileGap[] {
 
   if (!profile.fullName) {
     gaps.push({ field: "fullName", message: "Candidate name is missing." });
+  }
+  if (!profile.email) {
+    gaps.push({ field: "email", message: "Contact email is missing." });
+  }
+  if (!profile.phone) {
+    gaps.push({ field: "phone", message: "Contact phone is missing." });
   }
   if (!profile.location) {
     gaps.push({ field: "location", message: "Candidate location is missing." });

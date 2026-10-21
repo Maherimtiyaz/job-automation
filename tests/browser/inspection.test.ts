@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -65,6 +65,21 @@ function applicationFormHtml(): string {
 </body></html>`;
 }
 
+function fileUploadFormHtml(): string {
+  return `<!doctype html>
+<html><head><title>Apply - File Upload</title></head>
+<body>
+<h1>Application</h1>
+<form method="post" action="/apply/submit" enctype="multipart/form-data">
+<label for="resume">Resume</label>
+<input id="resume" name="resume" type="file" required>
+<label for="cover">Cover letter</label>
+<textarea id="cover" name="coverLetter" placeholder="Introduce yourself"></textarea>
+<button type="submit">Submit Application</button>
+</form>
+</body></html>`;
+}
+
 function plainHtml(): string {
   return `<!doctype html>
 <html><head><title>A Plain Page</title></head>
@@ -92,6 +107,11 @@ before(async () => {
     if (path === "/apply/1") {
       res.writeHead(200, { "Content-Type": "text/html" });
       res.end(applicationFormHtml());
+      return;
+    }
+    if (path === "/apply/file") {
+      res.writeHead(200, { "Content-Type": "text/html" });
+      res.end(fileUploadFormHtml());
       return;
     }
     if (path === "/redirect") {
@@ -243,7 +263,7 @@ test("writes a screenshot when requested", async () => {
     assert.ok(existsSync(target), "screenshot file should exist");
     assert.ok(readFileSync(target).length > 0);
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    await removeDirRecursive(dir);
   }
 });
 
@@ -263,7 +283,7 @@ test("writeInspectionReport emits a sanitized JSON file", async () => {
     assert.equal(parsed.pageKind, "application_form");
     assert.ok(parsed.hiddenFieldCount >= 1);
   } finally {
-    rmSync(dir, { recursive: true, force: true });
+    await removeDirRecursive(dir);
   }
 });
 
@@ -333,6 +353,90 @@ test("CLI browser inspect-job does not mutate application or review state", asyn
     } finally {
       db2.close();
     }
+  } finally {
+    captured.restore();
+    await removeDirRecursive(dir);
+  }
+});
+
+test("CLI browser inspect-url emits a read-only fill plan and redacts values by default", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "jobauto-fillplan-"));
+  const captured = captureConsole();
+  try {
+    const profilePath = join(dir, "profile.json");
+    writeFileSync(
+      profilePath,
+      JSON.stringify({ fullName: "Ada Lovelace", email: "ada@example.com" }),
+      "utf8",
+    );
+    process.env.PROFILE_PATH = profilePath;
+    process.env.DATABASE_PATH = join(dir, "test.db");
+    process.env.COMPANIES_PATH = join(dir, "companies.json");
+
+    const url = `${baseUrl}/apply/1`;
+
+    const code = await runCli(["browser", "inspect-url", url, "--fill-plan"]);
+    assert.equal(code, 0);
+    const redacted = captured.logs.join("\n");
+    assert.ok(redacted.includes("Fill plan"));
+    assert.ok(redacted.includes("[PROVIDE]"));
+    assert.ok(redacted.includes("value=<redacted>"));
+    assert.ok(!redacted.includes("ada@example.com"), "value must be redacted by default");
+    assert.ok(!redacted.includes("Jane Secret Doe"), "page field values must never appear");
+
+    captured.logs.length = 0;
+    const shownCode = await runCli(["browser", "inspect-url", url, "--fill-plan", "--show-values"]);
+    assert.equal(shownCode, 0);
+    const shown = captured.logs.join("\n");
+    assert.ok(shown.includes("ada@example.com"));
+    assert.ok(!shown.includes("Jane Secret Doe"));
+  } finally {
+    captured.restore();
+    await removeDirRecursive(dir);
+  }
+});
+
+test("CLI fill plan attaches a stored resume for a file field", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "jobauto-resume-cli-"));
+  const captured = captureConsole();
+  try {
+    const resumeFile = join(dir, "Ada_Resume.pdf");
+    writeFileSync(resumeFile, "%PDF fake resume", "utf8");
+    const registryPath = join(dir, "resumes.json");
+    writeFileSync(
+      registryPath,
+      `${JSON.stringify(
+        {
+          version: 1,
+          resumes: [
+            {
+              id: "ada-resume",
+              label: "Ada Resume",
+              kind: "resume",
+              filePath: resumeFile,
+              isDefault: true,
+              notes: null,
+              createdAt: "2026-01-01T00:00:00.000Z",
+            },
+          ],
+        },
+        null,
+        2,
+      )}\n`,
+      "utf8",
+    );
+
+    process.env.RESUME_PATH = registryPath;
+    process.env.PROFILE_PATH = join(dir, "profile.json");
+    process.env.DATABASE_PATH = join(dir, "test.db");
+    process.env.COMPANIES_PATH = join(dir, "companies.json");
+
+    const code = await runCli(["browser", "inspect-url", `${baseUrl}/apply/file`, "--fill-plan"]);
+    assert.equal(code, 0);
+    const output = captured.logs.join("\n");
+    assert.ok(output.includes("[PROVIDE]"));
+    assert.ok(output.includes("[attach: Ada_Resume.pdf]"));
+    assert.ok(output.includes("resume store"));
   } finally {
     captured.restore();
     await removeDirRecursive(dir);
