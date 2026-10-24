@@ -12,10 +12,12 @@ import type { Db } from "./db/connection.js";
 import { openDatabase } from "./db/connection.js";
 import { getDatabaseStats } from "./db/diagnostics.js";
 import { DomainError } from "./domain/errors.js";
+import { DEFAULT_FOLLOW_UP_DAYS, selectFollowUps } from "./domain/followUp.js";
 import type { Job } from "./domain/job.js";
 import { RECOMMENDATIONS } from "./domain/job.js";
 import { normalizeCompanyName } from "./domain/normalize.js";
 import { computeApplicationAnalytics } from "./domain/analytics.js";
+import { nowIso } from "./domain/time.js";
 import type { ApplicationAnalyticsReport, GroupBreakdown, RateMetric } from "./domain/analytics.js";
 import { describeProfileGaps } from "./domain/profile.js";
 import type { CandidateProfile } from "./domain/profile.js";
@@ -143,6 +145,8 @@ Commands:
                       List applications that need human action (oldest first)
   applications review <id> [--inspect] [--headed] [--timeout MS] [--output PATH]
                       Print a read-only pre-submission review packet; never fills or submits
+  applications follow-ups [--days N] [--limit N]
+                      List SUBMITTED applications that are due for a follow-up
   applications status <id> <STATUS> [--message TEXT]
   applications events <id>
   analytics [--source S] [--company NAME]
@@ -165,6 +169,7 @@ Options:
   --timeout MS        Navigation timeout in milliseconds (default: 15000)
   --target URL        Explicit application URL to use instead of resolving the Apply link
   --inspect           Inspect the recorded target while building a review packet
+  --days N            Follow-up threshold in days (default: 7)
   --fill-plan         Map detected form fields to profile data (read-only; never fills)
   --show-values       Include profile values in the fill plan (redacted by default)
   --resume ID         Attach a resume from the store by id (applications create)
@@ -376,9 +381,7 @@ async function runDashboard(): Promise<number> {
       );
     }
 
-    const needsAttention = applications
-      .list()
-      .filter((app) => app.status === "WAITING_FOR_HUMAN" || app.status === "SUBMITTED");
+    const needsAttention = applications.listByStatuses(HUMAN_ACTION_STATUSES);
     console.log("");
     console.log("Needs attention:");
     if (needsAttention.length === 0) {
@@ -387,9 +390,24 @@ async function runDashboard(): Promise<number> {
       for (const app of needsAttention.slice(0, 5)) {
         const job = jobs.findById(app.jobId);
         console.log(
-          `  application ${app.id} [${app.status}]: ${job?.title ?? `job ${app.jobId}`}`,
+          `  application ${app.id} [${app.status}]: ${job?.title ?? `job ${app.jobId}`} ` +
+            `- next: ${describeHumanAction(app)}`,
         );
       }
+    }
+
+    const followUps = selectFollowUps(applications.list(), {
+      now: nowIso(),
+      minDays: DEFAULT_FOLLOW_UP_DAYS,
+    });
+    console.log("");
+    console.log(`Follow-ups due (>= ${DEFAULT_FOLLOW_UP_DAYS} days): ${followUps.length}`);
+    for (const item of followUps.slice(0, 5)) {
+      const job = jobs.findById(item.application.jobId);
+      console.log(
+        `  application ${item.application.id} [${item.daysWaiting}d]: ` +
+          `${job?.title ?? `job ${item.application.jobId}`}`,
+      );
     }
 
     console.log("");
@@ -1201,6 +1219,8 @@ async function runApplications(argv: readonly string[]): Promise<number> {
       return await runApplicationQueue(rest);
     case "review":
       return await runApplicationReview(rest);
+    case "follow-ups":
+      return await runApplicationFollowUps(rest);
     case "status":
       return await runApplicationStatus(rest);
     case "events":
@@ -1208,7 +1228,7 @@ async function runApplications(argv: readonly string[]): Promise<number> {
     default:
       if (subcommand === "") {
         console.error(
-          "Error: missing applications subcommand (create | list | show | prepare | queue | review | status | events).",
+          "Error: missing applications subcommand (create | list | show | prepare | queue | review | follow-ups | status | events).",
         );
         return 1;
       }
@@ -1651,6 +1671,53 @@ async function runApplicationReview(argv: readonly string[]): Promise<number> {
     console.log(`Wrote review packet to ${written}.`);
   }
   return 0;
+}
+
+async function runApplicationFollowUps(argv: readonly string[]): Promise<number> {
+  const parsed = parseArgs(argv);
+  const days = readIntFlag(parsed, "days", -1) ?? DEFAULT_FOLLOW_UP_DAYS;
+  const limit = readIntFlag(parsed, "limit", 0) ?? 25;
+
+  return withDatabase((db) => {
+    const applications = new ApplicationRepository(db);
+    const jobs = new JobRepository(db);
+    const companies = new CompanyRepository(db);
+
+    const items = selectFollowUps(applications.list(), { now: nowIso(), minDays: days });
+    const shown = items.slice(0, limit);
+
+    if (shown.length === 0) {
+      console.log(`No follow-ups due (no SUBMITTED application is at least ${days} day(s) old).`);
+      return 0;
+    }
+
+    console.log(
+      `Follow-ups due: ${items.length} ` +
+        `(SUBMITTED for at least ${days} day(s), no outcome recorded)`,
+    );
+    for (const item of shown) {
+      const application = item.application;
+      const job = jobs.findById(application.jobId);
+      const company = job !== null ? companies.findById(job.companyId) : undefined;
+      const title =
+        job !== null
+          ? `${company?.name ?? `company ${job.companyId}`} - ${job.title}`
+          : `job #${application.jobId}`;
+      console.log(`  application ${application.id}: ${title}`);
+      console.log(
+        `      submitted ${application.submittedAt} (${item.daysWaiting}d ago)` +
+          `${application.applicationUrl !== null ? ` - ${application.applicationUrl}` : ""}`,
+      );
+      console.log(
+        `      next: follow up with the company, then record the outcome with ` +
+          `"applications status ${application.id} INTERVIEW|REJECTED|OFFER --message ..."`,
+      );
+    }
+    if (items.length > shown.length) {
+      console.log(`  ... ${items.length - shown.length} more (raise --limit to see them)`);
+    }
+    return 0;
+  });
 }
 
 function packetFormFromFillPlan(plan: FillPlan): PacketForm {

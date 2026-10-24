@@ -42,6 +42,8 @@ The compiled entry point is also the CLI:
 - `node dist/index.js applications review <id> [--inspect] [--headed] [--timeout MS] [--output PATH]`
   — print/write a read-only pre-submission review packet (target, documents,
     contact, optional fill-plan summary, checklist); never fills or submits
+- `node dist/index.js applications follow-ups [--days N] [--limit N]`
+  — list still-SUBMITTED applications that are due for a follow-up (oldest first)
 - `node dist/index.js resumes:init [--force]` / `resumes:list`
 - `node dist/index.js resumes:add --file <path> [--id ID] [--label TEXT] [--kind resume|cover_letter] [--default] [--notes TEXT]`
 - `node dist/index.js resumes:default --id ID` / `resumes:remove --id ID`
@@ -476,6 +478,24 @@ pre-submission packet. Neither command writes to the database or the web page.
 - `--output PATH` writes the packet as JSON; the full local resume path is
   reduced to `fileName` (basename). The packet is advisory: `SUBMITTED` is still
   reachable only from `APPROVED` and must represent a real, human submission.
+
+## Follow-up queue (read-only)
+
+`applications follow-ups [--days N] [--limit N]` surfaces submitted applications
+that have gone quiet. A recorded outcome moves an application out of `SUBMITTED`,
+so a row that is still `SUBMITTED` means the outcome has not been logged.
+
+- `src/domain/followUp.ts` is pure: `selectFollowUps(applications, { now, minDays })`
+  filters `SUBMITTED` rows with a `submittedAt`, drops invalid timestamps, keeps
+  whole days waiting `>= minDays`, and sorts the most overdue first.
+  `daysSince()` is the injectable clock helper; the CLI supplies `nowIso()`.
+- Defaults: `DEFAULT_FOLLOW_UP_DAYS = 7`, `--limit 25`; `--days 0` includes
+  same-day submissions.
+- The command only reads. It prints the submission date, days waiting, target,
+  and the exact `applications status <id> INTERVIEW|REJECTED|OFFER` command to
+  record the real outcome; it never contacts anyone.
+- The dashboard uses the same helper for its "Follow-ups due" line and now lists
+  human-action applications with their next command.
 
 ## Testing
 
