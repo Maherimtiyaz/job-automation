@@ -8,6 +8,7 @@ import {
   ValidationError,
 } from "../src/domain/errors.js";
 import { ApplicationRepository } from "../src/repositories/applications.js";
+import { JobRepository } from "../src/repositories/jobs.js";
 import { createTestDatabase, seedCompanyAndJob } from "./support/db.js";
 
 test("creates an application with an initial audit event", () => {
@@ -258,6 +259,51 @@ test("migration v4 adds the application target columns", () => {
     ]) {
       assert.ok(names.has(expected), `applications should have column ${expected}`);
     }
+  } finally {
+    close();
+  }
+});
+
+test("lists applications by a set of statuses", () => {
+  const { db, close } = createTestDatabase();
+  try {
+    const { companyId, jobId } = seedCompanyAndJob(db);
+    const jobs = new JobRepository(db);
+    const applications = new ApplicationRepository(db);
+
+    const secondJob = jobs.create({
+      companyId,
+      title: "Backend Engineer",
+      url: "https://acme.test/jobs/2",
+      source: "acme",
+    });
+    const thirdJob = jobs.create({
+      companyId,
+      title: "Platform Engineer",
+      url: "https://acme.test/jobs/3",
+      source: "acme",
+    });
+
+    const waiting = applications.create({ jobId: secondJob.id });
+    applications.transitionStatus(waiting.id, "IN_PROGRESS");
+    applications.transitionStatus(waiting.id, "WAITING_FOR_HUMAN");
+
+    const approved = applications.create({ jobId: thirdJob.id });
+    applications.transitionStatus(approved.id, "IN_PROGRESS");
+    applications.transitionStatus(approved.id, "APPROVED");
+
+    const draft = applications.create({ jobId });
+
+    const rows = applications.listByStatuses(["WAITING_FOR_HUMAN", "APPROVED"]);
+    assert.deepEqual(
+      rows.map((row) => row.id).sort((left, right) => left - right),
+      [waiting.id, approved.id].sort((left, right) => left - right),
+    );
+    assert.ok(
+      rows.every((row) => row.status === "WAITING_FOR_HUMAN" || row.status === "APPROVED"),
+    );
+    assert.ok(!rows.some((row) => row.id === draft.id));
+    assert.deepEqual(applications.listByStatuses([]), []);
   } finally {
     close();
   }

@@ -1,10 +1,12 @@
 import type { AppConfig } from "./config.js";
 import { ConfigError, loadConfig } from "./config.js";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { basename, dirname, resolve } from "node:path";
 import { BrowserService } from "./browser/browserService.js";
 import { resolveApplyTarget } from "./browser/applyTarget.js";
 import { buildFillPlan } from "./browser/fillPlan.js";
 import { printFillPlan, printInspectionReport, writeInspectionReport } from "./browser/report.js";
-import type { InspectOperationOptions, InspectionReport } from "./browser/types.js";
+import type { FillPlan, InspectOperationOptions, InspectionReport } from "./browser/types.js";
 import { validateInspectUrl } from "./browser/urlPolicy.js";
 import type { Db } from "./db/connection.js";
 import { openDatabase } from "./db/connection.js";
@@ -27,7 +29,20 @@ import {
   type ResumeKind,
 } from "./domain/resume.js";
 import { REVIEW_STATUSES, ReviewStatusSchema, type ReviewStatus } from "./domain/review.js";
-import { APPLICATION_STATUSES, ApplicationStatusSchema } from "./domain/status.js";
+import {
+  buildReviewPacket,
+  describeHumanAction,
+  HUMAN_ACTION_STATUSES,
+  type PacketContact,
+  type PacketDocument,
+  type PacketForm,
+  type ReviewPacket,
+} from "./domain/reviewPacket.js";
+import {
+  APPLICATION_STATUSES,
+  ApplicationStatusSchema,
+  type ApplicationStatus,
+} from "./domain/status.js";
 import { ingestJobs } from "./ingest/ingest.js";
 import {
   loadProfileFromFile,
@@ -124,6 +139,10 @@ Commands:
                       [--output PATH] [--timeout MS] [--fill-plan] [--show-values]
                       Resolve the real application target in a read-only browser and
                       hand off for human review (never fills or submits)
+  applications queue [--status S] [--limit N]
+                      List applications that need human action (oldest first)
+  applications review <id> [--inspect] [--headed] [--timeout MS] [--output PATH]
+                      Print a read-only pre-submission review packet; never fills or submits
   applications status <id> <STATUS> [--message TEXT]
   applications events <id>
   analytics [--source S] [--company NAME]
@@ -142,9 +161,10 @@ Options:
   --force             Overwrite existing template files
   --headed            Show the browser window instead of running headless
   --screenshot        Save a screenshot (default: screenshots/inspect-<timestamp>.png)
-  --output PATH       Write the inspection report as JSON to PATH
+  --output PATH       Write the inspection report or review packet as JSON to PATH
   --timeout MS        Navigation timeout in milliseconds (default: 15000)
   --target URL        Explicit application URL to use instead of resolving the Apply link
+  --inspect           Inspect the recorded target while building a review packet
   --fill-plan         Map detected form fields to profile data (read-only; never fills)
   --show-values       Include profile values in the fill plan (redacted by default)
   --resume ID         Attach a resume from the store by id (applications create)
@@ -1177,6 +1197,10 @@ async function runApplications(argv: readonly string[]): Promise<number> {
       return await runApplicationShow(rest);
     case "prepare":
       return await runApplicationPrepare(rest);
+    case "queue":
+      return await runApplicationQueue(rest);
+    case "review":
+      return await runApplicationReview(rest);
     case "status":
       return await runApplicationStatus(rest);
     case "events":
@@ -1184,7 +1208,7 @@ async function runApplications(argv: readonly string[]): Promise<number> {
     default:
       if (subcommand === "") {
         console.error(
-          "Error: missing applications subcommand (create | list | show | prepare | status | events).",
+          "Error: missing applications subcommand (create | list | show | prepare | queue | review | status | events).",
         );
         return 1;
       }
@@ -1476,6 +1500,270 @@ async function runApplicationPrepare(argv: readonly string[]): Promise<number> {
   } finally {
     await service.close();
   }
+}
+
+async function runApplicationQueue(argv: readonly string[]): Promise<number> {
+  const parsed = parseArgs(argv);
+  const limit = readIntFlag(parsed, "limit", 0) ?? 25;
+  const statusFlag = readFlag(parsed, "status");
+
+  let statuses: readonly ApplicationStatus[] = HUMAN_ACTION_STATUSES;
+  if (statusFlag !== undefined) {
+    const parsedStatus = ApplicationStatusSchema.safeParse(statusFlag);
+    if (!parsedStatus.success) {
+      console.error(`Error: --status must be one of: ${APPLICATION_STATUSES.join(", ")}.`);
+      return 1;
+    }
+    statuses = [parsedStatus.data];
+  }
+
+  return withDatabase((db) => {
+    const applications = new ApplicationRepository(db);
+    const jobs = new JobRepository(db);
+    const companies = new CompanyRepository(db);
+
+    const rows = applications.listByStatuses(statuses);
+    const items = rows.slice(0, limit);
+
+    if (items.length === 0) {
+      console.log("No applications need human action.");
+      return 0;
+    }
+
+    const counts = new Map<string, number>();
+    for (const row of rows) {
+      counts.set(row.status, (counts.get(row.status) ?? 0) + 1);
+    }
+    const countLine = [...counts.entries()]
+      .map(([status, count]) => `${status}=${count}`)
+      .join("  ");
+    console.log(`Applications needing human action: ${rows.length} (${countLine})`);
+
+    for (const application of items) {
+      const job = jobs.findById(application.jobId);
+      const company = job !== null ? companies.findById(job.companyId) : undefined;
+      const title =
+        job !== null
+          ? `${company?.name ?? `company ${job.companyId}`} - ${job.title}`
+          : `job #${application.jobId}`;
+      console.log(`  application ${application.id}: [${application.status}] ${title}`);
+      console.log(
+        `      target: ${application.applicationUrl ?? "not resolved"}` +
+          `${application.applicationAts !== null ? ` (${application.applicationAts})` : ""}`,
+      );
+      console.log(
+        `      updated ${describeAge(application.lastUpdatedAt)} ago ` +
+          `- next: ${describeHumanAction(application)}`,
+      );
+    }
+
+    if (rows.length > items.length) {
+      console.log(`  ... ${rows.length - items.length} more (raise --limit to see them)`);
+    }
+    return 0;
+  });
+}
+
+async function runApplicationReview(argv: readonly string[]): Promise<number> {
+  const parsed = parseArgs(argv);
+  const id = Number(parsed.positionals[0]);
+  if (!Number.isSafeInteger(id) || id <= 0) {
+    console.error(
+      "Error: applications review requires a positive application id (e.g. applications review 1).",
+    );
+    return 1;
+  }
+
+  const output = readFlag(parsed, "output");
+  const inspect = parsed.flags["inspect"] === true;
+  const headed = parsed.flags["headed"] === true;
+  const timeout = readIntFlag(parsed, "timeout", 0);
+
+  const loaded = await withDatabase((db, config) => {
+    const applications = new ApplicationRepository(db);
+    const application = applications.getById(id);
+    const job = new JobRepository(db).getById(application.jobId);
+    const company = new CompanyRepository(db).findById(job.companyId);
+    const registry = tryLoadResumeRegistry(config.RESUME_PATH);
+    const profile = profileExists(config.PROFILE_PATH)
+      ? loadProfileFromFile(config.PROFILE_PATH)
+      : null;
+    return { application, job, companyName: company?.name ?? null, registry, profile };
+  });
+
+  let form: PacketForm | null = null;
+  if (inspect) {
+    const target = loaded.application.applicationUrl;
+    if (target === null) {
+      console.error(
+        `Error: application ${id} has no recorded target. Run applications prepare ${id} first.`,
+      );
+      return 1;
+    }
+
+    const service = new BrowserService({
+      headless: !headed,
+      ...(timeout !== undefined ? { navigationTimeoutMs: timeout } : {}),
+    });
+    try {
+      const options: InspectOperationOptions = {};
+      if (timeout !== undefined) {
+        options.navigationTimeoutMs = timeout;
+      }
+      const report = await service.inspect(target, options);
+      if (report.status !== "ok") {
+        const details = report.problems.map((problem) => problem.message).join("; ");
+        console.error(`Error: could not inspect the recorded target. ${details}`);
+        return 1;
+      }
+      const fillPlan = buildFillPlan({
+        forms: report.forms,
+        profile: loaded.profile,
+        resumes: loaded.registry,
+        pageKind: report.pageKind,
+        hasApplicationForm: report.hasApplicationForm,
+        includeValues: false,
+      });
+      form = packetFormFromFillPlan(fillPlan);
+    } finally {
+      await service.close();
+    }
+  }
+
+  const packet = buildReviewPacket({
+    application: loaded.application,
+    job: loaded.job,
+    companyName: loaded.companyName,
+    resumeDocument: toPacketDocument(
+      loaded.registry !== null ? defaultResumeForKind(loaded.registry, "resume") : null,
+    ),
+    coverLetterDocument: toPacketDocument(
+      loaded.registry !== null ? defaultResumeForKind(loaded.registry, "cover_letter") : null,
+    ),
+    profile: loaded.profile,
+    form,
+  });
+
+  printReviewPacket(packet);
+
+  if (output !== undefined) {
+    const written = writeReviewPacket(output, packet);
+    console.log(`Wrote review packet to ${written}.`);
+  }
+  return 0;
+}
+
+function packetFormFromFillPlan(plan: FillPlan): PacketForm {
+  return {
+    pageKind: plan.pageKind,
+    hasApplicationForm: plan.hasApplicationForm,
+    forms: plan.summary.forms,
+    fields: plan.summary.fields,
+    provide: plan.summary.provide,
+    needsInput: plan.summary.needsInput,
+    skip: plan.summary.skip,
+    requiredNeedsInput: plan.summary.requiredNeedsInput,
+    needsInputLabels: plan.entries
+      .filter((entry) => entry.decision === "NEEDS_INPUT")
+      .map((entry) => entry.label ?? entry.name ?? entry.field),
+  };
+}
+
+function toPacketDocument(document: ResumeDocument | null): PacketDocument | null {
+  if (document === null) {
+    return null;
+  }
+  return {
+    id: document.id,
+    label: document.label,
+    kind: document.kind,
+    fileName: basename(document.filePath),
+  };
+}
+
+function writeReviewPacket(path: string, packet: ReviewPacket): string {
+  const target = resolve(path);
+  mkdirSync(dirname(target), { recursive: true });
+  writeFileSync(target, `${JSON.stringify(packet, null, 2)}\n`, "utf8");
+  return target;
+}
+
+function printReviewPacket(packet: ReviewPacket): void {
+  console.log(`Application ${packet.applicationId} review packet`);
+  console.log(
+    `  Job:      ${packet.job.title}` +
+      `${packet.job.company !== null ? ` at ${packet.job.company}` : ""}`,
+  );
+  console.log(`  Status:   ${packet.status}`);
+  console.log(
+    `  Target:   ${packet.target.url ?? "-"}` +
+      `${packet.target.source !== null ? ` (${packet.target.source})` : ""}`,
+  );
+  console.log(`  ATS:      ${packet.target.ats ?? "-"}`);
+  console.log(`  Resume:   ${describePacketDocument(packet.documents.resume)}`);
+  console.log(`  Cover:    ${describePacketDocument(packet.documents.coverLetter)}`);
+  console.log(`  Contact:  ${describeContact(packet.contact)}`);
+  console.log(`  Form:     ${describePacketForm(packet.form)}`);
+  console.log("Checklist:");
+  for (const item of packet.checklist) {
+    console.log(`  [${item.severity}] ${item.message}`);
+  }
+  console.log(
+    `Ready to submit: ${packet.summary.readyToSubmit ? "YES" : "NO"} ` +
+      `(${packet.summary.ok} ok, ${packet.summary.warn} warning(s), ` +
+      `${packet.summary.block} blocking)`,
+  );
+  console.log("Next steps:");
+  packet.nextSteps.forEach((step, index) => {
+    console.log(`  ${index + 1}. ${step}`);
+  });
+}
+
+function describePacketDocument(document: PacketDocument | null): string {
+  if (document === null) {
+    return "-";
+  }
+  return `${document.label} [${document.id}] (${document.fileName})`;
+}
+
+function describeContact(contact: PacketContact): string {
+  const parts = [
+    contact.fullName,
+    contact.email,
+    contact.phone,
+    contact.location,
+    contact.linkedinUrl,
+    contact.githubUrl,
+    contact.websiteUrl,
+  ].filter((value): value is string => value !== null);
+  return parts.length > 0 ? parts.join(" | ") : "-";
+}
+
+function describePacketForm(form: PacketForm | null): string {
+  if (form === null) {
+    return "not inspected (pass --inspect)";
+  }
+  return (
+    `${form.pageKind} | ${form.forms} form(s), ${form.fields} field(s) | ` +
+    `provide ${form.provide}, needs input ${form.needsInput} ` +
+    `(${form.requiredNeedsInput} required), skip ${form.skip}`
+  );
+}
+
+function describeAge(iso: string): string {
+  const then = Date.parse(iso);
+  if (Number.isNaN(then)) {
+    return "unknown";
+  }
+  const minutes = Math.floor(Math.max(0, Date.now() - then) / 60_000);
+  if (minutes < 60) {
+    return `${minutes}m`;
+  }
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) {
+    return `${hours}h`;
+  }
+  return `${Math.floor(hours / 24)}d`;
 }
 
 function describeResumeVersion(registry: ResumeRegistry | null, version: string | null): string {

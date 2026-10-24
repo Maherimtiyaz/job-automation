@@ -36,6 +36,12 @@ The compiled entry point is also the CLI:
 - `node dist/index.js applications prepare <id> [--target URL] [--headed] [--screenshot [PATH]] [--output PATH] [--timeout MS] [--fill-plan] [--show-values]`
   — resolve the real application target in a read-only browser, record it, and hand
     off to a human at `WAITING_FOR_HUMAN`; never fills or submits
+- `node dist/index.js applications queue [--status S] [--limit N]`
+  — list applications that need human action (WAITING_FOR_HUMAN, APPROVED,
+    IN_PROGRESS), oldest first, with the next command
+- `node dist/index.js applications review <id> [--inspect] [--headed] [--timeout MS] [--output PATH]`
+  — print/write a read-only pre-submission review packet (target, documents,
+    contact, optional fill-plan summary, checklist); never fills or submits
 - `node dist/index.js resumes:init [--force]` / `resumes:list`
 - `node dist/index.js resumes:add --file <path> [--id ID] [--label TEXT] [--kind resume|cover_letter] [--default] [--notes TEXT]`
 - `node dist/index.js resumes:default --id ID` / `resumes:remove --id ID`
@@ -441,6 +447,35 @@ would be submitted and stops for a human.
   application untouched (still `DRAFT`).
 - Tests use a local `node:http` fixture server and assert the persisted target, the
   audit trail (`DRAFT -> IN_PROGRESS -> WAITING_FOR_HUMAN`), and the safe failure path.
+
+## Human review queue and packet (read-only)
+
+`applications queue` and `applications review <id>` close the loop after
+`applications prepare`: they show what a human still has to do and assemble a
+pre-submission packet. Neither command writes to the database or the web page.
+
+- `src/domain/reviewPacket.ts` is pure. `buildReviewPacket(input)` combines the
+  stored application/job, default resume/cover letter, candidate profile, and an
+  optional fill-plan summary into a `ReviewPacket`: target, documents (basename
+  only), contact fields, checklist, `summary.readyToSubmit`, and next steps.
+- Checklist severities: `ok`, `warn`, `block`. A missing target or a required
+  field that still needs input is a `block`; missing profile/contact/cover letter
+  and an uninspected target are warnings. `readyToSubmit` is true when no item
+  blocks.
+- `describeHumanAction()` maps a queue status to the next command:
+  `WAITING_FOR_HUMAN -> applications review <id>`,
+  `APPROVED -> apply manually, then applications status <id> SUBMITTED`,
+  `IN_PROGRESS -> applications prepare <id>`.
+- `ApplicationRepository#listByStatuses()` returns the queue oldest-updated first
+  (most stale first). `HUMAN_ACTION_STATUSES` is `WAITING_FOR_HUMAN`, `APPROVED`,
+  `IN_PROGRESS`.
+- `applications review <id> --inspect` performs one read-only inspection of the
+  recorded target and folds the existing fill plan into the packet. It uses
+  `includeValues: false`, so the packet never contains form values or profile
+  values; `needsInputLabels` carries field labels only.
+- `--output PATH` writes the packet as JSON; the full local resume path is
+  reduced to `fileName` (basename). The packet is advisory: `SUBMITTED` is still
+  reachable only from `APPROVED` and must represent a real, human submission.
 
 ## Testing
 

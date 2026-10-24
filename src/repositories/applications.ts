@@ -208,6 +208,21 @@ export class ApplicationRepository {
     return rows.map(mapApplication);
   }
 
+  /** Oldest-updated first, so the most stale human action surfaces at the top. */
+  listByStatuses(statuses: readonly ApplicationStatus[]): Application[] {
+    if (statuses.length === 0) {
+      return [];
+    }
+    const placeholders = statuses.map(() => "?").join(", ");
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM applications WHERE status IN (${placeholders}) ` +
+          "ORDER BY last_updated_at ASC, id ASC",
+      )
+      .all(...statuses) as ApplicationRow[];
+    return rows.map(mapApplication);
+  }
+
   list(): Application[] {
     const rows = this.db
       .prepare("SELECT * FROM applications ORDER BY last_updated_at DESC, id DESC")
