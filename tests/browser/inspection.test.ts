@@ -89,6 +89,49 @@ function plainHtml(): string {
 </body></html>`;
 }
 
+function formlessApplicationHtml(): string {
+  return `<!doctype html>
+<html><head><title>Apply - Formless</title></head>
+<body>
+<h1>Application</h1>
+<label for="name">Name</label><input id="name" name="fullName" required>
+<label for="email">Email</label><input id="email" name="email" type="email">
+<label for="resume">Resume</label><input id="resume" name="resume" type="file" required>
+<button type="button">Submit Application</button>
+</body></html>`;
+}
+
+function strayInputsHtml(): string {
+  return `<!doctype html>
+<html><head><title>Job Board</title></head>
+<body>
+<h1>Jobs</h1>
+<a href="/apply/1">Apply Now</a>
+<input type="search" name="q" placeholder="Search jobs">
+<input type="email" name="newsletter" placeholder="Email me jobs">
+</body></html>`;
+}
+
+function clientRenderedFormHtml(): string {
+  return `<!doctype html>
+<html><head><title>Apply - Client Rendered</title></head>
+<body>
+<div id="root"><p>Loading application form...</p></div>
+<script>
+  setTimeout(() => {
+    document.getElementById("root").innerHTML =
+      '<h1>Application</h1>' +
+      '<form method="post" action="/apply/submit">' +
+      '<label for="name">Name</label><input id="name" name="fullName" required>' +
+      '<label for="email">Email</label><input id="email" name="email" type="email">' +
+      '<label for="resume">Resume</label><input id="resume" name="resume" type="file" required>' +
+      '<button type="submit">Submit Application</button>' +
+      '</form>';
+  }, 500);
+</script>
+</body></html>`;
+}
+
 let server: Server;
 let baseUrl = "";
 let loopbackAliasUrl = "";
@@ -127,6 +170,21 @@ before(async () => {
     if (path === "/plain") {
       res.writeHead(200, { "Content-Type": "text/html" });
       res.end(plainHtml());
+      return;
+    }
+    if (path === "/spa") {
+      res.writeHead(200, { "Content-Type": "text/html" });
+      res.end(clientRenderedFormHtml());
+      return;
+    }
+    if (path === "/formless") {
+      res.writeHead(200, { "Content-Type": "text/html" });
+      res.end(formlessApplicationHtml());
+      return;
+    }
+    if (path === "/stray") {
+      res.writeHead(200, { "Content-Type": "text/html" });
+      res.end(strayInputsHtml());
       return;
     }
     res.writeHead(404);
@@ -211,6 +269,49 @@ test("treats a page with no ATS signals as UNKNOWN", async () => {
   assert.equal(report.ats.platform, "UNKNOWN");
   assert.equal(report.ats.confidence, "low");
   assert.equal(report.pageKind, "unknown");
+});
+
+test("waits for a client-rendered form to mount before inspecting", async () => {
+  const report = await sharedBrowserService().inspect(`${baseUrl}/spa`);
+  assert.equal(report.status, "ok");
+  assert.equal(report.pageKind, "application_form");
+  assert.equal(report.hasApplicationForm, true);
+  assert.equal(report.forms.length, 1);
+  assert.deepEqual(
+    report.forms[0]?.fields.map((field) => field.name).sort(),
+    ["email", "fullName", "resume"],
+  );
+});
+
+test("skips client-rendered content when the settle window is disabled", async () => {
+  const report = await sharedBrowserService().inspect(`${baseUrl}/spa`, { settleTimeoutMs: 1 });
+  assert.equal(report.status, "ok");
+  assert.equal(report.pageKind, "unknown");
+  assert.equal(report.hasApplicationForm, false);
+});
+
+test("detects application controls that are not wrapped in a form element", async () => {
+  const report = await sharedBrowserService().inspect(`${baseUrl}/formless`);
+  assert.equal(report.status, "ok");
+  assert.equal(report.pageKind, "application_form");
+  assert.equal(report.hasApplicationForm, true);
+  assert.equal(report.forms.length, 1);
+  const form = report.forms[0];
+  assert.ok(form);
+  assert.equal(form.action, null);
+  assert.deepEqual(form.submitButtons, ["Submit Application"]);
+  assert.deepEqual(
+    form.fields.map((field) => field.name).sort(),
+    ["email", "fullName", "resume"],
+  );
+});
+
+test("does not mistake stray search and newsletter inputs for an application", async () => {
+  const report = await sharedBrowserService().inspect(`${baseUrl}/stray`);
+  assert.equal(report.status, "ok");
+  assert.equal(report.pageKind, "job_detail");
+  assert.equal(report.hasApplicationForm, false);
+  assert.equal(report.forms.length, 0);
 });
 
 test("reports a navigation timeout as a failed inspection", async () => {

@@ -190,10 +190,18 @@ export interface InspectOperationOptions {
   screenshot?: string | true;
   navigationTimeoutMs?: number;
   operationTimeoutMs?: number;
+  settleTimeoutMs?: number;
 }
 
 export interface BrowserServiceOptions {
   headless: boolean;
   navigationTimeoutMs: number;
   operationTimeoutMs: number;
+  /**
+   * Upper bound on the post-navigation settle window. Client-rendered
+   * application pages (Ashby, Workday, ...) fetch and mount their form after
+   * `domcontentloaded`, so the DOM is inspected only after the page has
+   * stopped loading for a moment or the window is exhausted.
+   */
+  settleTimeoutMs: number;
 }

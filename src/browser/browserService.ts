@@ -1,7 +1,7 @@
 import { mkdirSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { performance } from "node:perf_hooks";
-import { chromium, type Browser, type Response } from "playwright";
+import { chromium, type Browser, type Page, type Response } from "playwright";
 import { detectAts } from "./ats.js";
 import { BrowserLaunchError } from "./errors.js";
 import { analyzePage, classifyPage, emptyPageParts, extractDomSource } from "./inspector.js";
@@ -20,8 +20,13 @@ import { classifyNetwork, validateInspectUrl } from "./urlPolicy.js";
 const DEFAULT_OPTIONS: BrowserServiceOptions = {
   headless: true,
   navigationTimeoutMs: 15_000,
-  operationTimeoutMs: 8_000,
+  operationTimeoutMs: 20_000,
+  settleTimeoutMs: 2_500,
 };
+
+/** Keep this much of the operation budget free for DOM extraction and screenshots. */
+const SETTLE_RESERVE_MS = 600;
+const SETTLE_POLL_INTERVAL_MS = 150;
 
 const FATAL_KINDS = new Set(["navigation", "timeout", "unsupported_protocol", "browser"]);
 
@@ -32,6 +37,9 @@ interface PageWorkInput {
   warnings: InspectionWarning[];
   problems: InspectionProblem[];
   navigationTimeoutMs: number;
+  settleTimeoutMs: number;
+  /** Absolute `performance.now()` instant at which the operation is aborted. */
+  deadlineAt: number;
   screenshot: string | true | undefined;
 }
 
@@ -138,6 +146,7 @@ export class BrowserService {
 
     const navigationTimeoutMs = options.navigationTimeoutMs ?? this.options.navigationTimeoutMs;
     const operationTimeoutMs = options.operationTimeoutMs ?? this.options.operationTimeoutMs;
+    const settleTimeoutMs = options.settleTimeoutMs ?? this.options.settleTimeoutMs;
     const startedAt = performance.now();
 
     let work: PageWorkResult;
@@ -151,6 +160,8 @@ export class BrowserService {
             warnings,
             problems,
             navigationTimeoutMs,
+            settleTimeoutMs,
+            deadlineAt: startedAt + operationTimeoutMs,
             screenshot: options.screenshot,
           }),
         operationTimeoutMs,
@@ -250,6 +261,11 @@ export class BrowserService {
         }
       }
 
+      if (response !== null) {
+        const remaining = input.deadlineAt - performance.now() - SETTLE_RESERVE_MS;
+        await this.settlePage(page, Math.min(input.settleTimeoutMs, remaining));
+      }
+
       let raw: RawDomInspection | null = null;
       try {
         raw = (await page.evaluate<RawDomInspection>(extractDomSource)) as RawDomInspection;
@@ -274,6 +290,41 @@ export class BrowserService {
       return { response, finalUrl, raw, screenshotPath };
     } finally {
       await context.close();
+    }
+  }
+
+  /**
+   * Give client-rendered pages a bounded chance to mount their content.
+   *
+   * Waits for the network to go idle (a SPA fetches its form after
+   * `domcontentloaded`), then polls for form controls until the window closes.
+   * Every step is bounded and failure-tolerant: a page that never settles is
+   * inspected as-is rather than failing the operation.
+   */
+  private async settlePage(page: Page, budgetMs: number): Promise<void> {
+    if (budgetMs <= 0) {
+      return;
+    }
+    const startedAt = performance.now();
+    await page.waitForLoadState("networkidle", { timeout: Math.max(1, Math.round(budgetMs)) }).catch(() => {
+      // Slow pages keep the operation moving: inspect what is on screen.
+    });
+
+    while (performance.now() - startedAt < budgetMs) {
+      const hasControls = await page
+        .evaluate<boolean>(
+          () =>
+            document.querySelector(
+              "form, input:not([type=file]):not([type=hidden]), textarea, select",
+            ) !== null,
+        )
+        .catch(() => true);
+      if (hasControls) {
+        return;
+      }
+      await page.waitForTimeout(SETTLE_POLL_INTERVAL_MS).catch(() => {
+        // The context can close mid-settle; treat it as "nothing more to wait for".
+      });
     }
   }
 

@@ -12,6 +12,7 @@ interface TextRule {
 
 const HOST_RULES: readonly HostRule[] = [
   { platform: "Greenhouse", indicators: ["greenhouse.io", "greenhouse"] },
+  { platform: "Ashby", indicators: ["ashbyhq.com"] },
   { platform: "Lever", indicators: ["lever.co"] },
   { platform: "Workday", indicators: ["myworkdayjobs.com", "workday"] },
   { platform: "iCIMS", indicators: ["icims"] },
@@ -21,6 +22,7 @@ const HOST_RULES: readonly HostRule[] = [
 
 const TEXT_RULES: readonly TextRule[] = [
   { platform: "Greenhouse", indicators: ["powered by greenhouse", "greenhouse.io"] },
+  { platform: "Ashby", indicators: ["powered by ashby", "ashbyhq.com"] },
   { platform: "Lever", indicators: ["powered by lever", "jobs.lever.co"] },
   { platform: "iCIMS", indicators: ["powered by icims", "icims careers"] },
   { platform: "SmartRecruiters", indicators: ["powered by smartrecruiters", "jobs.smartrecruiters.com"] },

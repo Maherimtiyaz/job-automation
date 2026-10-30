@@ -413,9 +413,19 @@ handle authentication, and never touch `applications`/`review_events`.
   read or reported.
 - Page classification: `application_form` when fillable fields exist (reliability `observed`
   at >= 3 fields, otherwise `heuristic`), `job_detail` from apply links + headings, else
-  `unknown`. ATS detection matches known hostnames (`greenhouse.io`, `lever.co`,
-  `myworkdayjobs.com`, `icims`, `smartrecruiters`, `jazzhr`) and on-page text
+  `unknown`. ATS detection matches known hostnames (`greenhouse.io`, `ashbyhq.com`,
+  `lever.co`, `myworkdayjobs.com`, `icims`, `smartrecruiters`, `jazzhr`) and on-page text
   (e.g. "Powered by Greenhouse") and falls back to `UNKNOWN`/`low` when nothing matches.
+- Settle window: after `domcontentloaded` the service waits for `networkidle` and then
+  polls for a non-file form control, bounded by `settleTimeoutMs` (default 2500 ms, capped
+  by the remaining operation budget). Client-rendered ATS pages (Ashby, Workday) mount
+  their form after the initial document, so inspecting immediately saw an empty body.
+  Slow or chatty pages are never failed by this: the wait is bounded and best-effort.
+  `operationTimeoutMs` defaults to 20000 ms so navigation + settle + extraction fit.
+- Form-less applications: some SPAs (Ashby) render controls without a `<form>` element.
+  Controls outside any form are reported as one synthetic form (action/method `null`) when
+  the page has >= 3 visible fillable controls, or >= 2 plus an apply/submit/continue button.
+  Two stray search/newsletter inputs never qualify on their own.
 - Inspection is a read-only side questionnaire: it never updates job scored fields,
   applications, or review events.
 - Tests use a local `node:http` fixture server on `127.0.0.1` and a shared `BrowserService`;

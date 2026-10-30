@@ -95,73 +95,105 @@ export const extractDomSource: string = `
   };
 
   const forms = [];
+  const readField = function (field) {
+    const tag = field.tagName.toLowerCase();
+    const rawType = (field.getAttribute("type") || "").toLowerCase();
+    if (tag === "input" && (rawType === "hidden" || rawType === "submit" || rawType === "button" || rawType === "reset")) {
+      return null;
+    }
+    const fieldKind = tag === "textarea" ? "textarea" : tag === "select" ? "select" : "input";
+    const inputType = fieldKind === "input" ? (rawType === "" ? "text" : rawType) : null;
+
+    const selectOptionTexts = [];
+    if (fieldKind === "select") {
+      const options = field.options || [];
+      for (let k = 0; k < options.length; k += 1) {
+        const option = options[k];
+        if (option === undefined || option === null) continue;
+        const optionText = cleanText(option.text);
+        if (optionText !== "") {
+          selectOptionTexts.push(optionText.length > 60 ? optionText.slice(0, 57) + "..." : optionText);
+        }
+      }
+    }
+
+    return {
+      kind: fieldKind,
+      inputType: inputType,
+      name: field.getAttribute("name"),
+      label: labelTextFor(field),
+      placeholder: field.getAttribute("placeholder"),
+      autocomplete: field.getAttribute("autocomplete"),
+      requiredAttr: field.getAttribute("required") !== null,
+      ariaRequired: field.getAttribute("aria-required") === "true",
+      readonly: field.readOnly === true,
+      disabled: field.disabled === true,
+      hidden: false,
+      selectOptionTexts: selectOptionTexts,
+    };
+  };
+
+  const collectFields = function (scope, visibleOnly, skipInForms) {
+    const collected = [];
+    const fieldNodes = scope.querySelectorAll("input, textarea, select");
+    for (let j = 0; j < fieldNodes.length; j += 1) {
+      const field = fieldNodes[j];
+      if (field === undefined || field === null) continue;
+      if (skipInForms && field.closest("form") !== null) continue;
+      if (visibleOnly && typeof field.getClientRects === "function" && field.getClientRects().length === 0) continue;
+      const mapped = readField(field);
+      if (mapped !== null) {
+        collected.push(mapped);
+      }
+    }
+    return collected;
+  };
+
+  const collectButtons = function (scope, visibleOnly) {
+    const collected = [];
+    const buttonNodes = scope.querySelectorAll("button, input[type=submit], input[type=button]");
+    for (let j = 0; j < buttonNodes.length; j += 1) {
+      const button = buttonNodes[j];
+      if (button === undefined || button === null) continue;
+      if (visibleOnly && typeof button.getClientRects === "function" && button.getClientRects().length === 0) continue;
+      const text = cleanText(button.textContent) || cleanText(button.getAttribute("value"));
+      if (text !== "") {
+        collected.push(text.length > 80 ? text.slice(0, 77) + "..." : text);
+      }
+    }
+    return collected;
+  };
+
   const formNodes = doc.querySelectorAll("form");
   for (let i = 0; i < formNodes.length; i += 1) {
     const form = formNodes[i];
     if (form === undefined || form === null) continue;
 
-    const fields = [];
-    const fieldNodes = form.querySelectorAll("input, textarea, select");
-    for (let j = 0; j < fieldNodes.length; j += 1) {
-      const field = fieldNodes[j];
-      if (field === undefined || field === null) continue;
-
-      const tag = field.tagName.toLowerCase();
-      const rawType = (field.getAttribute("type") || "").toLowerCase();
-      if (tag === "input" && (rawType === "hidden" || rawType === "submit" || rawType === "button" || rawType === "reset")) {
-        continue;
-      }
-
-      const fieldKind = tag === "textarea" ? "textarea" : tag === "select" ? "select" : "input";
-      const inputType = fieldKind === "input" ? (rawType === "" ? "text" : rawType) : null;
-
-      const selectOptionTexts = [];
-      if (fieldKind === "select") {
-        const options = field.options || [];
-        for (let k = 0; k < options.length; k += 1) {
-          const option = options[k];
-          if (option === undefined || option === null) continue;
-          const optionText = cleanText(option.text);
-          if (optionText !== "") {
-            selectOptionTexts.push(optionText.length > 60 ? optionText.slice(0, 57) + "..." : optionText);
-          }
-        }
-      }
-
-      fields.push({
-        kind: fieldKind,
-        inputType: inputType,
-        name: field.getAttribute("name"),
-        label: labelTextFor(field),
-        placeholder: field.getAttribute("placeholder"),
-        autocomplete: field.getAttribute("autocomplete"),
-        requiredAttr: field.getAttribute("required") !== null,
-        ariaRequired: field.getAttribute("aria-required") === "true",
-        readonly: field.readOnly === true,
-        disabled: field.disabled === true,
-        hidden: false,
-        selectOptionTexts: selectOptionTexts,
-      });
-    }
-
-    const submitButtons = [];
-    const buttonNodes = form.querySelectorAll("button, input[type=submit], input[type=button]");
-    for (let j = 0; j < buttonNodes.length; j += 1) {
-      const button = buttonNodes[j];
-      if (button === undefined || button === null) continue;
-      const text = cleanText(button.textContent) || cleanText(button.getAttribute("value"));
-      if (text !== "") {
-        submitButtons.push(text.length > 80 ? text.slice(0, 77) + "..." : text);
-      }
-    }
-
     const rawAction = form.getAttribute("action");
     forms.push({
       action: resolveUrl(rawAction, doc.baseURI) || rawAction,
       method: (form.getAttribute("method") || "get").toLowerCase(),
-      fields: fields,
-      submitButtons: submitButtons,
+      fields: collectFields(form, false, false),
+      submitButtons: collectButtons(form, false),
     });
+  }
+
+  // Some client-rendered ATS pages (Ashby, for example) mount their controls
+  // without a <form> element. Report those as one synthetic form when the page
+  // clearly looks like an application instead of a stray search box.
+  const orphanFields = collectFields(doc, true, true);
+  if (orphanFields.length >= 2) {
+    const orphanButtons = collectButtons(doc, true).filter(function (text) {
+      return /apply|submit|send|continue|next/i.test(text);
+    });
+    if (orphanFields.length >= 3 || orphanButtons.length > 0) {
+      forms.push({
+        action: null,
+        method: null,
+        fields: orphanFields,
+        submitButtons: orphanButtons,
+      });
+    }
   }
 
   const hiddenInputCountTotal = doc.querySelectorAll('input[type="hidden"]').length;
