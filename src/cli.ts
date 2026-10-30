@@ -11,6 +11,7 @@ import { validateInspectUrl } from "./browser/urlPolicy.js";
 import type { Db } from "./db/connection.js";
 import { openDatabase } from "./db/connection.js";
 import { getDatabaseStats } from "./db/diagnostics.js";
+import { selectApplyQueue } from "./domain/applyQueue.js";
 import { DomainError } from "./domain/errors.js";
 import { DEFAULT_FOLLOW_UP_DAYS, selectFollowUps } from "./domain/followUp.js";
 import type { Job } from "./domain/job.js";
@@ -124,17 +125,15 @@ Commands:
   jobs reopen <id>    Return a reviewed job to NEW
   jobs review-history <id>
                       Show the review/event history for a job
+  jobs apply-queue [--limit N]
+                      List READY_TO_APPLY jobs that have no application yet
   applications create <jobId> [--resume VERSION] [--default-resume] [--notes TEXT]
                       [--default-resume] attaches the store's default resume
-  resumes:init [--force]
-                      Write a starter resume registry template to RESUME_PATH
-  resumes:list        List resumes/cover letters in the local store
-  resumes:add --file PATH [--label TEXT] [--kind resume|cover_letter] [--id ID]
-                      [--default] [--notes TEXT]
-                      Register a local resume/cover-letter file
-  resumes:remove --id ID
-  resumes:default --id ID
-                      Set the default resume/cover letter for its kind
+  applications start <jobId> [--resume VERSION] [--default-resume] [--notes TEXT]
+                      [--target URL] [--headed] [--screenshot [PATH]] [--output PATH]
+                      [--timeout MS] [--fill-plan] [--show-values]
+                      Create the application if needed, resolve its target read-only,
+                      and hand off for human review (never fills or submits)
   applications list [--status S] [--limit N]
   applications show <id>
   applications prepare <id> [--target URL] [--headed] [--screenshot [PATH]]
@@ -379,6 +378,23 @@ async function runDashboard(): Promise<number> {
       console.log(
         `  ${status}: ${lifecycleCounts[status] ?? 0}`,
       );
+    }
+
+    const applyQueue = selectApplyQueue(
+      jobs.list(),
+      new Set(applications.list().map((application) => application.jobId)),
+    );
+    console.log("");
+    console.log(`Ready to start (READY_TO_APPLY, no application): ${applyQueue.length}`);
+    for (const job of applyQueue.slice(0, 5)) {
+      const company = companies.findById(job.companyId);
+      const score = job.scoreTotal === null ? "unscored" : job.scoreTotal.toFixed(1);
+      console.log(
+        `  job ${job.id} [${score}]: ${company?.name ?? `company ${job.companyId}`} - ${job.title}`,
+      );
+    }
+    if (applyQueue.length > 5) {
+      console.log(`  ... and ${applyQueue.length - 5} more (run "jobs apply-queue")`);
     }
 
     const needsAttention = applications.listByStatuses(HUMAN_ACTION_STATUSES);
@@ -709,7 +725,6 @@ async function runJobs(argv: readonly string[]): Promise<number> {
     case "sources":
       return await runJobsSources();
     case "discover":
-    case "discover":
       return await runJobsDiscover(rest);
     case "list":
       return await runJobsList(rest);
@@ -727,10 +742,12 @@ async function runJobs(argv: readonly string[]): Promise<number> {
       return await runJobsTransition(rest, "NEW");
     case "review-history":
       return await runJobsReviewHistory(rest);
+    case "apply-queue":
+      return await runJobsApplyQueue(rest);
     default:
       if (subcommand === "") {
         console.error(
-          "Error: missing jobs subcommand (sources | discover | list | show | review | shortlist | dismiss | ready | reopen | review-history).",
+          "Error: missing jobs subcommand (sources | discover | list | show | review | shortlist | dismiss | ready | reopen | review-history | apply-queue).",
         );
         return 1;
       }
@@ -1103,6 +1120,48 @@ async function runJobsReviewHistory(argv: readonly string[]): Promise<number> {
   });
 }
 
+async function runJobsApplyQueue(argv: readonly string[]): Promise<number> {
+  const parsed = parseArgs(argv);
+  const limit = readIntFlag(parsed, "limit", 0) ?? 25;
+
+  return withDatabase((db) => {
+    const jobs = new JobRepository(db);
+    const applications = new ApplicationRepository(db);
+    const companies = new CompanyRepository(db);
+
+    const appliedJobIds = new Set(applications.list().map((application) => application.jobId));
+    const queue = selectApplyQueue(jobs.list(), appliedJobIds);
+    const shown = queue.slice(0, limit);
+
+    if (queue.length === 0) {
+      console.log(
+        "Apply queue is empty. Mark reviewed jobs with \"jobs ready <id>\" to add them here.",
+      );
+      return 0;
+    }
+
+    console.log(
+      `Apply queue: ${queue.length} READY_TO_APPLY job(s) without an application` +
+        `${shown.length < queue.length ? ` (showing ${shown.length})` : ""}`,
+    );
+    for (const job of shown) {
+      const company = companies.findById(job.companyId);
+      const score = job.scoreTotal === null ? "unscored" : job.scoreTotal.toFixed(1);
+      const recommendation = job.scoreRecommendation ? ` ${job.scoreRecommendation}` : "";
+      const workplace = job.workplaceType !== "unknown" ? ` (${job.workplaceType})` : "";
+      console.log(
+        `  job ${job.id} [${score}${recommendation}] ` +
+          `${company?.name ?? `company ${job.companyId}`} - ${job.title}${workplace}`,
+      );
+      console.log(`      next: applications start ${job.id}`);
+    }
+    if (shown.length < queue.length) {
+      console.log(`  ... ${queue.length - shown.length} more (raise --limit to see them)`);
+    }
+    return 0;
+  });
+}
+
 async function runJobsShow(argv: readonly string[]): Promise<number> {
   const parsed = parseArgs(argv);
   const id = Number(parsed.positionals[0]);
@@ -1209,6 +1268,8 @@ async function runApplications(argv: readonly string[]): Promise<number> {
   switch (subcommand) {
     case "create":
       return await runApplicationCreate(rest);
+    case "start":
+      return await runApplicationStart(rest);
     case "list":
       return await runApplicationList(rest);
     case "show":
@@ -1228,7 +1289,7 @@ async function runApplications(argv: readonly string[]): Promise<number> {
     default:
       if (subcommand === "") {
         console.error(
-          "Error: missing applications subcommand (create | list | show | prepare | queue | review | follow-ups | status | events).",
+          "Error: missing applications subcommand (create | start | list | show | prepare | queue | review | follow-ups | status | events).",
         );
         return 1;
       }
@@ -1284,6 +1345,95 @@ async function runApplicationCreate(argv: readonly string[]): Promise<number> {
     );
     return 0;
   });
+}
+
+async function runApplicationStart(argv: readonly string[]): Promise<number> {
+  const parsed = parseArgs(argv);
+  const jobId = Number(parsed.positionals[0]);
+  if (!Number.isSafeInteger(jobId) || jobId <= 0) {
+    console.error(
+      "Error: applications start requires a positive job id (e.g. applications start 12).",
+    );
+    return 1;
+  }
+
+  const existing = await withDatabase((db) => new ApplicationRepository(db).findByJobId(jobId));
+
+  let applicationId: number;
+  if (existing === null) {
+    const createArgs = [String(jobId)];
+    const resume = readFlag(parsed, "resume");
+    if (resume !== undefined) {
+      createArgs.push("--resume", resume);
+    }
+    if (parsed.flags["default-resume"] === true) {
+      createArgs.push("--default-resume");
+    }
+    const notes = readFlag(parsed, "notes");
+    if (notes !== undefined) {
+      createArgs.push("--notes", notes);
+    }
+
+    const created = await runApplicationCreate(createArgs);
+    if (created !== 0) {
+      return created;
+    }
+
+    const id = await withDatabase(
+      (db) => new ApplicationRepository(db).findByJobId(jobId)?.id ?? null,
+    );
+    if (id === null) {
+      console.error(`Error: application for job ${jobId} was not created.`);
+      return 1;
+    }
+    applicationId = id;
+  } else {
+    applicationId = existing.id;
+    if (existing.status === "WAITING_FOR_HUMAN") {
+      console.log(`Application ${applicationId} already awaits human review.`);
+      console.log(`Next: applications review ${applicationId}`);
+      return 0;
+    }
+    if (existing.status !== "DRAFT" && existing.status !== "IN_PROGRESS") {
+      console.error(
+        `Error: application ${applicationId} is ${existing.status}; ` +
+          "only DRAFT or IN_PROGRESS applications can be started.",
+      );
+      return 1;
+    }
+    console.log(`Starting application ${applicationId} for job ${jobId}.`);
+  }
+
+  const prepareArgs = [String(applicationId)];
+  const target = readFlag(parsed, "target");
+  if (target !== undefined) {
+    prepareArgs.push("--target", target);
+  }
+  if (parsed.flags["headed"] === true) {
+    prepareArgs.push("--headed");
+  }
+  const screenshot = parsed.flags["screenshot"];
+  if (screenshot === true) {
+    prepareArgs.push("--screenshot");
+  } else if (typeof screenshot === "string") {
+    prepareArgs.push("--screenshot", screenshot);
+  }
+  const output = readFlag(parsed, "output");
+  if (output !== undefined) {
+    prepareArgs.push("--output", output);
+  }
+  const timeout = readFlag(parsed, "timeout");
+  if (timeout !== undefined) {
+    prepareArgs.push("--timeout", timeout);
+  }
+  if (parsed.flags["fill-plan"] === true) {
+    prepareArgs.push("--fill-plan");
+  }
+  if (parsed.flags["show-values"] === true) {
+    prepareArgs.push("--show-values");
+  }
+
+  return await runApplicationPrepare(prepareArgs);
 }
 
 async function runApplicationList(argv: readonly string[]): Promise<number> {

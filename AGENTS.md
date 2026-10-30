@@ -29,7 +29,12 @@ The compiled entry point is also the CLI:
 - `node dist/index.js jobs review [--limit N] [--min-score N] [--state S] [--include-all]`
 - `node dist/index.js jobs shortlist <id> [--reason TEXT]` / `jobs dismiss <id> [--reason TEXT]`
 - `node dist/index.js jobs ready <id>` / `jobs reopen <id>` / `jobs review-history <id>`
+- `node dist/index.js jobs apply-queue [--limit N]`
+  — list `READY_TO_APPLY` jobs that have no application yet, highest score first
 - `node dist/index.js applications create <jobId> [--resume VERSION | --default-resume] [--notes TEXT]`
+- `node dist/index.js applications start <jobId> [--resume VERSION | --default-resume] [--notes TEXT]`
+  `[--target URL] [--headed] [--screenshot [PATH]] [--output PATH] [--timeout MS] [--fill-plan] [--show-values]`
+  — create the application if needed, then run the read-only `prepare` handoff
 - `node dist/index.js applications list [--status S] [--limit N]`
 - `node dist/index.js applications show <id>` / `applications status <id> <STATUS> [--message TEXT]`
 - `node dist/index.js applications events <id>`
@@ -422,7 +427,8 @@ clicks nothing, and never submits — it is a decision report layered on top of 
   `name` field is not treated as a person name when company/institution tokens are present.
 - Values are **redacted by default** in both console output and the sanitized JSON report;
   `--show-values` includes them explicitly. Sensitive fields never carry a value.
-- Resume-file and cover-letter fields are always `NEEDS_INPUT` (no resume store yet).
+- Resume-file and cover-letter fields stay `NEEDS_INPUT` when the store has no default
+  document for that kind (or no store is configured); they become `PROVIDE` otherwise.
 - The plan is attached as the optional `fillPlan` field of `InspectionReport`; without
   `--fill-plan` the report is unchanged. Printing lives in `report.ts#printFillPlan`.
 
@@ -478,6 +484,26 @@ pre-submission packet. Neither command writes to the database or the web page.
 - `--output PATH` writes the packet as JSON; the full local resume path is
   reduced to `fileName` (basename). The packet is advisory: `SUBMITTED` is still
   reachable only from `APPROVED` and must represent a real, human submission.
+
+## Apply queue and one-command start
+
+`jobs apply-queue` and `applications start <jobId>` bridge triage and preparation:
+they surface the reviewed jobs that have no application record and start one without
+making the operator look up ids.
+
+- `src/domain/applyQueue.ts` is pure: `selectApplyQueue(jobs, appliedJobIds)` keeps
+  `reviewStatus === "READY_TO_APPLY"` rows whose id is not in `appliedJobIds`, orders
+  by `scoreTotal` descending, puts unscored jobs last, and breaks ties by lowest job id.
+- `jobs apply-queue [--limit N]` (default 25) prints each job's score, recommendation,
+  company, title, and the exact `applications start <jobId>` command.
+- `applications start <jobId>` reuses the existing commands rather than duplicating
+  them: if the job has no application it calls the `create` path (same validation and
+  resume flags), then always calls the `prepare` path. It never fills, clicks, uploads,
+  or submits.
+- If an application is already `WAITING_FOR_HUMAN`, `start` is a no-op that prints
+  `applications review <id>`. `DRAFT`/`IN_PROGRESS` applications are prepared in place
+  (no duplicate row). `APPROVED` and later statuses are refused.
+- The dashboard adds a "Ready to start" section driven by the same helper.
 
 ## Follow-up queue (read-only)
 
