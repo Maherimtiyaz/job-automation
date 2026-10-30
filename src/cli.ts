@@ -1,6 +1,6 @@
 import type { AppConfig } from "./config.js";
 import { ConfigError, loadConfig } from "./config.js";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, dirname, resolve } from "node:path";
 import { BrowserService } from "./browser/browserService.js";
 import { resolveApplyTarget } from "./browser/applyTarget.js";
@@ -16,6 +16,7 @@ import { DomainError } from "./domain/errors.js";
 import { DEFAULT_FOLLOW_UP_DAYS, selectFollowUps } from "./domain/followUp.js";
 import type { Job } from "./domain/job.js";
 import { RECOMMENDATIONS } from "./domain/job.js";
+import { JobImportFileSchema } from "./domain/jobImport.js";
 import { normalizeCompanyName } from "./domain/normalize.js";
 import { computeApplicationAnalytics } from "./domain/analytics.js";
 import { nowIso } from "./domain/time.js";
@@ -47,6 +48,7 @@ import {
   type ApplicationStatus,
 } from "./domain/status.js";
 import { ingestJobs } from "./ingest/ingest.js";
+import { importJobs, type ImportOutcome } from "./ingest/importJobs.js";
 import {
   loadProfileFromFile,
   profileExists,
@@ -113,6 +115,9 @@ Commands:
   jobs sources        List supported job sources and enabled company counts
   jobs discover [--source greenhouse|lever] [--limit N] [--dry-run] [--company NAME]
                       Fetch and ingest job listings from registered companies
+  jobs import --file PATH [--source S] [--dry-run]
+                      Import job listings from a JSON file (companies are created
+                      as needed; the candidate profile scores them when present)
   jobs list [--limit N] [--min-score N] [--recommendation R] [--source S]
                       [--company NAME] [--state NEW|SHORTLISTED|DISMISSED|READY_TO_APPLY]
                       List jobs, highest score first
@@ -726,6 +731,8 @@ async function runJobs(argv: readonly string[]): Promise<number> {
       return await runJobsSources();
     case "discover":
       return await runJobsDiscover(rest);
+    case "import":
+      return await runJobsImport(rest);
     case "list":
       return await runJobsList(rest);
     case "show":
@@ -747,7 +754,7 @@ async function runJobs(argv: readonly string[]): Promise<number> {
     default:
       if (subcommand === "") {
         console.error(
-          "Error: missing jobs subcommand (sources | discover | list | show | review | shortlist | dismiss | ready | reopen | review-history | apply-queue).",
+          "Error: missing jobs subcommand (sources | discover | import | list | show | review | shortlist | dismiss | ready | reopen | review-history | apply-queue).",
         );
         return 1;
       }
@@ -777,6 +784,88 @@ async function runJobsSources(): Promise<number> {
     console.log(`  ${sourceId.padEnd(12)} ${adapter.description} (${enabled} enabled)`);
   }
   return 0;
+}
+
+function describeImportOutcome(outcome: ImportOutcome): string {
+  switch (outcome) {
+    case "inserted":
+      return "+";
+    case "updated":
+      return "~";
+    case "duplicate":
+      return "=";
+    case "invalid":
+      return "!";
+  }
+}
+
+async function runJobsImport(argv: readonly string[]): Promise<number> {
+  const parsed = parseArgs(argv);
+  const file = readFlag(parsed, "file");
+  if (file === undefined) {
+    console.error('Error: jobs import requires --file PATH (e.g. jobs import --file listings.json).');
+    return 1;
+  }
+  const source = readFlag(parsed, "source");
+  const dryRun = parsed.flags["dry-run"] === true;
+
+  let raw: string;
+  try {
+    raw = readFileSync(resolve(file), "utf8");
+  } catch {
+    console.error(`Error: could not read ${file}.`);
+    return 1;
+  }
+
+  let json: unknown;
+  try {
+    json = JSON.parse(raw);
+  } catch {
+    console.error(`Error: ${file} is not valid JSON.`);
+    return 1;
+  }
+
+  const parsedFile = JobImportFileSchema.safeParse(json);
+  if (!parsedFile.success) {
+    const details = parsedFile.error.issues.map((issue) => issue.message).join("; ");
+    console.error(`Error: invalid import file: ${details}`);
+    return 1;
+  }
+
+  const config = loadConfig();
+  const profile = profileExists(config.PROFILE_PATH)
+    ? loadProfileFromFile(config.PROFILE_PATH)
+    : null;
+
+  return withDatabase((db) => {
+    const result = importJobs(db, parsedFile.data.jobs, {
+      profile,
+      ...(source !== undefined ? { defaultSource: source } : {}),
+      dryRun,
+    });
+    const summary = result.summary;
+    console.log(
+      `${dryRun ? "Dry run: " : ""}Imported ${summary.rows} row(s) from ${file} ` +
+        `(profile: ${profile === null ? "not loaded" : "loaded"}).`,
+    );
+    console.log(
+      `  inserted: ${summary.inserted}  updated: ${summary.updated}  ` +
+        `duplicates: ${summary.duplicates}  invalid: ${summary.invalid}  ` +
+        `scoring failures: ${summary.scoringFailures}`,
+    );
+    for (const record of result.records.slice(0, 50)) {
+      const label =
+        record.company !== null && record.title !== null
+          ? `${record.title} @ ${record.company}`
+          : `row ${record.index + 1}`;
+      const detail = record.message !== null ? ` - ${record.message}` : "";
+      console.log(`  ${describeImportOutcome(record.outcome)} ${label}${detail}`);
+    }
+    if (result.records.length > 50) {
+      console.log(`  ... ${result.records.length - 50} more`);
+    }
+    return 0;
+  });
 }
 
 async function runJobsDiscover(argv: readonly string[]): Promise<number> {

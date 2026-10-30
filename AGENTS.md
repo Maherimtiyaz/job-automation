@@ -24,6 +24,8 @@ The compiled entry point is also the CLI:
 - `node dist/index.js companies:list` / `companies:enable --name X` / `companies:disable --name X`
 - `node dist/index.js jobs sources` — list sources and how many enabled companies target each
 - `node dist/index.js jobs discover [--source <greenhouse|lever>] [--limit N] [--dry-run] [--company NAME]`
+- `node dist/index.js jobs import --file PATH [--source S] [--dry-run]`
+  — import listings from a JSON export (companies created on demand)
 - `node dist/index.js jobs list [--limit N] [--min-score N] [--recommendation R] [--source S] [--company NAME] [--state S]`
 - `node dist/index.js jobs show <id>` — job details + stored score breakdown + relevance verdict
 - `node dist/index.js jobs review [--limit N] [--min-score N] [--state S] [--include-all]`
@@ -365,6 +367,26 @@ listing, upsert, and score. It never creates applications.
 
 Summary invariants (report these in CLI output): `valid = inserted + updated + duplicates`
 and `listingsFetched = valid + invalid`.
+
+## Importing external listings
+
+`jobs import --file PATH [--source S] [--dry-run]` adds listings discovered outside the
+Greenhouse/Lever adapters: a manual search, another agent's export, or a public
+aggregator API.
+
+- `src/domain/jobImport.ts` owns the format: `{ "version": 1, "jobs": [...] }`; each row
+  is validated by `ImportedJobSchema` (company, title, http(s) URL, optional source,
+  externalJobId, location, description, employment/salary/workplace fields). `jobs` is
+  typed `unknown[]` so one bad row is reported instead of rejecting the whole file.
+- `src/ingest/importJobs.ts` creates companies on demand (`getOrCreate`), upserts jobs
+  with the same dedupe-key rules as ingestion, scores with the local profile when
+  present, and reports `inserted`/`updated`/`duplicate`/`invalid` per row. It performs no
+  network I/O, creates no applications, and never submits.
+- Duplicates: the same dedupe key inside one file is a `duplicate`; a key that already
+  exists in the database is an `updated` row.
+- `--dry-run` reports the same counts without writing companies or jobs.
+- Imported jobs are ordinary rows: `jobs review`, `jobs ready`, `jobs apply-queue`, and
+  `applications start` treat them exactly like adapter-ingested jobs.
 
 ## Browser inspection
 
