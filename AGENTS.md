@@ -416,12 +416,13 @@ handle authentication, and never touch `applications`/`review_events`.
   `unknown`. ATS detection matches known hostnames (`greenhouse.io`, `ashbyhq.com`,
   `lever.co`, `myworkdayjobs.com`, `icims`, `smartrecruiters`, `jazzhr`) and on-page text
   (e.g. "Powered by Greenhouse") and falls back to `UNKNOWN`/`low` when nothing matches.
-- Settle window: after `domcontentloaded` the service waits for `networkidle` and then
-  polls for a non-file form control, bounded by `settleTimeoutMs` (default 2500 ms, capped
-  by the remaining operation budget). Client-rendered ATS pages (Ashby, Workday) mount
-  their form after the initial document, so inspecting immediately saw an empty body.
-  Slow or chatty pages are never failed by this: the wait is bounded and best-effort.
-  `operationTimeoutMs` defaults to 20000 ms so navigation + settle + extraction fit.
+- Settle window: after `domcontentloaded` the service waits for `networkidle`, then polls
+  for a non-file form control for up to 1.2 s, bounded by `settleTimeoutMs` (default
+  8000 ms, capped by the remaining operation budget). Client-rendered ATS pages (Ashby,
+  Workday) mount their form after the initial document — and boards differ a lot: Sticker
+  Mule idles in ~1 s, Plane in ~5.7 s. Slow or chatty pages are never failed by this: the
+  wait is bounded and best-effort. `operationTimeoutMs` defaults to 20000 ms so navigation
+  + settle + extraction fit.
 - Form-less applications: some SPAs (Ashby) render controls without a `<form>` element.
   Controls outside any form are reported as one synthetic form (action/method `null`) when
   the page has >= 3 visible fillable controls, or >= 2 plus an apply/submit/continue button.

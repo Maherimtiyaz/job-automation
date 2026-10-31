@@ -21,12 +21,14 @@ const DEFAULT_OPTIONS: BrowserServiceOptions = {
   headless: true,
   navigationTimeoutMs: 15_000,
   operationTimeoutMs: 20_000,
-  settleTimeoutMs: 2_500,
+  settleTimeoutMs: 8_000,
 };
 
 /** Keep this much of the operation budget free for DOM extraction and screenshots. */
 const SETTLE_RESERVE_MS = 600;
 const SETTLE_POLL_INTERVAL_MS = 150;
+/** How long to keep polling for controls once the network has gone idle. */
+const SETTLE_POLL_WINDOW_MS = 1_200;
 
 const FATAL_KINDS = new Set(["navigation", "timeout", "unsupported_protocol", "browser"]);
 
@@ -306,11 +308,13 @@ export class BrowserService {
       return;
     }
     const startedAt = performance.now();
-    await page.waitForLoadState("networkidle", { timeout: Math.max(1, Math.round(budgetMs)) }).catch(() => {
+    const idleBudget = Math.max(1, Math.round(budgetMs - Math.min(SETTLE_POLL_WINDOW_MS, budgetMs / 2)));
+    await page.waitForLoadState("networkidle", { timeout: idleBudget }).catch(() => {
       // Slow pages keep the operation moving: inspect what is on screen.
     });
 
-    while (performance.now() - startedAt < budgetMs) {
+    const pollUntil = Math.min(startedAt + budgetMs, performance.now() + SETTLE_POLL_WINDOW_MS);
+    while (performance.now() < pollUntil) {
       const hasControls = await page
         .evaluate<boolean>(
           () =>
