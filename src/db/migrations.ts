@@ -216,6 +216,24 @@ ALTER TABLE applications ADD COLUMN application_resolved_at TEXT;
 CREATE INDEX idx_applications_application_url ON applications (application_url);
 `;
 
+export const OUTREACH_DRAFTS = `
+CREATE TABLE outreach_drafts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  job_id INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+  recipient_name TEXT,
+  recipient_email TEXT,
+  subject TEXT NOT NULL,
+  body TEXT NOT NULL,
+  word_count INTEGER NOT NULL,
+  evidence TEXT NOT NULL DEFAULT '[]',
+  gaps TEXT NOT NULL DEFAULT '[]',
+  created_at TEXT NOT NULL,
+  CONSTRAINT outreach_drafts_word_count_positive CHECK (word_count > 0)
+);
+
+CREATE INDEX idx_outreach_drafts_job_id ON outreach_drafts (job_id, id DESC);
+`;
+
 export const MIGRATIONS: readonly Migration[] = [
   {
     version: 1,
@@ -243,6 +261,13 @@ export const MIGRATIONS: readonly Migration[] = [
     name: "application_target",
     up: (db) => {
       db.exec(APPLICATION_TARGET);
+    },
+  },
+  {
+    version: 5,
+    name: "outreach_drafts",
+    up: (db) => {
+      db.exec(OUTREACH_DRAFTS);
     },
   },
 ];

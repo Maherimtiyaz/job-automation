@@ -58,6 +58,11 @@ The compiled entry point is also the CLI:
   — application pipeline metrics (funnel, response/interview/offer rates,
     time-to-submit, per-source and per-company breakdowns); read-only over the
     existing application lifecycle + `application_events`
+- `node dist/index.js outreach draft <jobId> [--recipient NAME] [--email ADDR] [--save] [--format text|json|eml] [--output PATH] [--resume-file NAME]`
+  — compose a short hiring-manager email from the posting and the stored profile;
+    nothing is sent
+- `node dist/index.js outreach list [--limit N]`
+  — list saved outreach drafts (newest first)
 - `node dist/index.js browser inspect-job <jobId> [--headed] [--screenshot [PATH]] [--output PATH] [--timeout MS] [--fill-plan] [--show-values]`
   — open a job's URL in a read-only browser and report what is on it
 - `node dist/index.js browser inspect-url <url> [--headed] [--screenshot [PATH]] [--output PATH] [--timeout MS] [--fill-plan] [--show-values]`
@@ -555,6 +560,47 @@ so a row that is still `SUBMITTED` means the outcome has not been logged.
   record the real outcome; it never contacts anyone.
 - The dashboard uses the same helper for its "Follow-ups due" line and now lists
   human-action applications with their next command.
+
+## Outreach drafts (compose-only)
+
+`outreach draft <jobId>` writes a short, specific email to a hiring manager from data
+that is already stored. It is the direct-outreach counterpart to the ATS form
+workflow: a note that shows you read the posting beats another row in a pile.
+
+- `src/domain/outreach.ts` is pure and deterministic: `buildOutreachDraft({ job,
+  companyName, profile, resumeFileName, recipientName, recipientEmail })` returns
+  `{ subject, body, wordCount, evidence, gaps }`. Same input, same output — no clock,
+  no I/O, no network, no model call.
+- Nothing is invented. Every factual sentence is listed in `evidence` with its
+  source (`job.description`, `profile.workExperience`, `profile.skills`,
+  `resume store default`). Data the profile does not contain becomes a `gap`
+  instead of copy: missing profile, name, email, skills, work experience, a posting
+  with nothing quotable, or no recipient name.
+- Opening: `findPostingHook()` picks the line worth quoting back. Stored descriptions
+  may still carry raw HTML, so `stripMarkup()` runs first. Candidate sentences are
+  filtered for boilerplate (EEO, benefits, salary, privacy, "apply here", company
+  marketing/statistics, `Location:`) and then scored: role-specific wording
+  (`ROLE_SIGNAL`) 3, work wording (`SIGNAL`) 2, the top matched skill 2, prose-like
+  shape 1. The best line that already fits the 180-char quote budget wins; otherwise
+  the best line is cut at a clause boundary and trailing dangling words are removed.
+- Proof: the most recent `workExperience` entry (open-ended roles first) plus the top
+  two profile skills that appear in the posting. `matchSkills()` ranks by title hit,
+  description hits, proficiency, then stated years, and breaks ties by skill name.
+- Drafts stay under 150 words (`OUTREACH_MAX_WORDS`); exceeding it is reported as a
+  `length` gap rather than silently truncated.
+- Rendering: `renderOutreachText()` (terminal, with evidence + gaps) and
+  `renderOutreachEml()` (RFC 822 with CRLF, `Content-Type: text/plain`). Header
+  values are rejected if they contain line breaks, so a `--recipient`/`--email`
+  value can never inject extra headers. `--format eml` requires `--email`.
+- Persistence: migration v5 (`outreach_drafts`) stores job id, recipient, subject,
+  body, word count, and the evidence/gaps arrays as JSON. `OutreachRepository`
+  (`save`, `latestForJob`, `list`, `count`) validates at the boundary and maps rows
+  to domain records. Stored JSON arrays that fail validation degrade to `[]` rather
+  than throwing.
+- Sending is out of scope: there is no SMTP client, no Gmail integration, and no
+  browser step. The operator pastes the draft or opens the `.eml` and sends it from
+  their own mail client. `outreach` never touches `applications`, `application_events`,
+  or `review_events`, and `SUBMITTED` remains reachable only from `APPROVED`.
 
 ## Testing
 

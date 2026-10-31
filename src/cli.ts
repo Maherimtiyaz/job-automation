@@ -18,6 +18,14 @@ import type { Job } from "./domain/job.js";
 import { RECOMMENDATIONS } from "./domain/job.js";
 import { JobImportFileSchema } from "./domain/jobImport.js";
 import { normalizeCompanyName } from "./domain/normalize.js";
+import {
+  buildOutreachDraft,
+  OUTREACH_FORMATS,
+  OutreachFormatSchema,
+  renderOutreachEml,
+  renderOutreachText,
+  type OutreachFormat,
+} from "./domain/outreach.js";
 import { computeApplicationAnalytics } from "./domain/analytics.js";
 import { nowIso } from "./domain/time.js";
 import type { ApplicationAnalyticsReport, GroupBreakdown, RateMetric } from "./domain/analytics.js";
@@ -80,6 +88,7 @@ import {
 import { CompanyRepository } from "./repositories/companies.js";
 import { JobRepository } from "./repositories/jobs.js";
 import { JobReviewRepository } from "./repositories/jobReviews.js";
+import { OutreachRepository } from "./repositories/outreach.js";
 import { scoreJobs } from "./scoring/scoreJobs.js";
 import { classifyRelevance, roleScoreFromBreakdown } from "./scoring/relevance.js";
 import { createSourceRegistry } from "./sources/registry.js";
@@ -156,6 +165,12 @@ Commands:
   analytics [--source S] [--company NAME]
                       Show application analytics: funnel, response/offer rates,
                       and per-source / per-company breakdowns
+  outreach draft <jobId> [--recipient NAME] [--email ADDR] [--save]
+                      [--format text|json|eml] [--output PATH] [--resume-file NAME]
+                      Compose a short hiring-manager email from the posting and
+                      the stored profile; nothing is sent
+  outreach list [--limit N]
+                      List saved outreach drafts (newest first)
   browser inspect-job <jobId> [--headed] [--screenshot [PATH]] [--output PATH]
                       [--timeout MS] [--fill-plan] [--show-values]
                       Open a job's URL in a read-only browser and report what is on it
@@ -178,6 +193,11 @@ Options:
   --show-values       Include profile values in the fill plan (redacted by default)
   --resume ID         Attach a resume from the store by id (applications create)
   --default-resume    Attach the store's default resume (applications create)
+  --recipient NAME    Hiring-manager name to greet in an outreach draft
+  --email ADDR        Recipient email (required for --format eml)
+  --save              Store the outreach draft in the database
+  --format F          Outreach output format: text | json | eml
+  --resume-file NAME  Resume filename to reference in an outreach draft
 
 Environment:
   DATABASE_PATH       SQLite database path (default: data/job-automation.db)
@@ -285,6 +305,8 @@ export async function runCli(argv: readonly string[]): Promise<number> {
         return await runApplications(rest);
       case "analytics":
         return await runAnalytics(rest);
+      case "outreach":
+        return await runOutreach(rest);
       case "browser":
         return await runBrowser(rest);
       case "help":
@@ -2338,4 +2360,135 @@ async function runBrowserInspection(
   } finally {
     await service.close();
   }
+}
+
+async function runOutreach(argv: readonly string[]): Promise<number> {
+  const [subcommand = "", ...rest] = argv;
+
+  switch (subcommand) {
+    case "draft":
+      return await runOutreachDraft(rest);
+    case "list":
+      return await runOutreachList(rest);
+    default:
+      if (subcommand === "") {
+        console.error("Error: missing outreach subcommand (draft | list).");
+        return 1;
+      }
+      console.error(`Unknown outreach subcommand: ${subcommand}`);
+      return 1;
+  }
+}
+
+async function runOutreachDraft(argv: readonly string[]): Promise<number> {
+  const parsed = parseArgs(argv);
+  const jobId = Number(parsed.positionals[0]);
+  if (!Number.isSafeInteger(jobId) || jobId <= 0) {
+    console.error(
+      "Error: outreach draft requires a positive job id (e.g. outreach draft 183).",
+    );
+    return 1;
+  }
+
+  const formatFlag = readFlag(parsed, "format") ?? "text";
+  const formatResult = OutreachFormatSchema.safeParse(formatFlag);
+  if (!formatResult.success) {
+    console.error(`Error: --format must be one of: ${OUTREACH_FORMATS.join(", ")}.`);
+    return 1;
+  }
+  const format: OutreachFormat = formatResult.data;
+
+  const recipientName = readFlag(parsed, "recipient") ?? null;
+  const recipientEmail = readFlag(parsed, "email") ?? null;
+  const shouldSave = parsed.flags["save"] === true;
+  const output = readFlag(parsed, "output");
+  const resumeOverride = readFlag(parsed, "resume-file") ?? null;
+
+  if (format === "eml" && recipientEmail === null) {
+    console.error("Error: --format eml needs a recipient address (--email ADDR).");
+    return 1;
+  }
+
+  return withDatabase((db, config) => {
+    const job = new JobRepository(db).getById(jobId);
+    const company = new CompanyRepository(db).findById(job.companyId);
+    const profile = profileExists(config.PROFILE_PATH)
+      ? loadProfileFromFile(config.PROFILE_PATH)
+      : null;
+
+    let resumeFileName = resumeOverride;
+    if (resumeFileName === null) {
+      const registry = tryLoadResumeRegistry(config.RESUME_PATH);
+      const document = registry === null ? null : defaultResumeForKind(registry, "resume");
+      resumeFileName = document === null ? null : basename(document.filePath);
+    }
+
+    const draft = buildOutreachDraft({
+      job,
+      companyName: company?.name ?? null,
+      profile,
+      resumeFileName,
+      recipientName,
+      recipientEmail,
+    });
+
+    if (shouldSave) {
+      const saved = new OutreachRepository(db).save(jobId, draft);
+      console.log(`Saved outreach draft ${saved.id} for job ${jobId}.`);
+      console.log("");
+    }
+
+    let rendered: string;
+    if (format === "json") {
+      rendered = JSON.stringify(draft, null, 2);
+    } else if (format === "eml") {
+      rendered = renderOutreachEml(draft, recipientEmail ?? "");
+    } else {
+      rendered = renderOutreachText(draft);
+    }
+
+    if (output !== undefined) {
+      const target = resolve(output);
+      mkdirSync(dirname(target), { recursive: true });
+      writeFileSync(target, rendered, "utf8");
+      console.log(`Wrote outreach draft to ${target}.`);
+    } else {
+      console.log(rendered);
+    }
+
+    if (!shouldSave && format === "text") {
+      console.log("");
+      console.log(`Nothing was sent. Save it with: outreach draft ${jobId} --save`);
+    }
+    return 0;
+  });
+}
+
+async function runOutreachList(argv: readonly string[]): Promise<number> {
+  const parsed = parseArgs(argv);
+  const limit = readIntFlag(parsed, "limit", 0) ?? 25;
+
+  return withDatabase((db) => {
+    const outreach = new OutreachRepository(db);
+    const total = outreach.count();
+    if (total === 0) {
+      console.log("No outreach drafts saved yet. Compose one: outreach draft <jobId> --save");
+      return 0;
+    }
+
+    const drafts = outreach.list(limit);
+    console.log(`Saved outreach drafts: ${total} (showing ${drafts.length})`);
+    for (const draft of drafts) {
+      const recipient = draft.recipientEmail ?? draft.recipientName ?? "(hiring manager)";
+      console.log(`  draft ${draft.id}: job ${draft.jobId} - ${draft.subject}`);
+      console.log(
+        `      to ${recipient} | ${draft.wordCount} words | ` +
+          `${draft.gaps.length} gap(s) | saved ${draft.createdAt}`,
+      );
+    }
+    if (total > drafts.length) {
+      console.log(`  ... ${total - drafts.length} more (raise --limit to see them)`);
+    }
+    return 0;
+  });
 }
